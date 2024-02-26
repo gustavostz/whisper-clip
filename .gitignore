@@ -787,3 +787,6 @@ FodyWeavers.xsd
 # Additional files built by Visual Studio
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pycharm+iml,venv,visualstudio,visualstudiocode,sublimetext,jupyternotebooks,pycharm+all
+
+# Avoid sending your audio files to the repository
+output/*
