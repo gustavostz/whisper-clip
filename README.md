@@ -3,8 +3,19 @@
 
 ![Example using WhisperClip](assets/readme/example-of-usage.gif)
 
-
 WhisperClip simplifies your life by automatically transcribing audio recordings and saving the text directly to your clipboard. With just a click of a button, you can effortlessly convert spoken words into written text, ready to be pasted wherever you need it. This application harnesses the power of OpenAI's Whisper for free, making transcription more accessible and convenient.
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+  - [Prerequisites](#prerequisites)
+  - [Setting Up the Environment](#setting-up-the-environment)
+  - [Choosing the Right Model](#choosing-the-right-model)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Feedback](#feedback)
+- [Acknowledgments](#acknowledgments)
 
 ## Features
 
@@ -60,6 +71,11 @@ python main.py
 
 - Click the microphone button to start and stop recording.
 - If "Save to Clipboard" is checked, the transcription will be copied to your clipboard automatically.
+
+## Configuration
+
+- The default shortcut for toggling recording is `Alt+Shift+R`. You can modify this in the `config.json` file.
+- You can also change the Whisper model used for transcription in the `config.json` file.
 
 ## Feedback
 
