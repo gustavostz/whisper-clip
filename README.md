@@ -28,7 +28,7 @@ WhisperClip simplifies your life by automatically transcribing audio recordings 
 ### Prerequisites
 
 - Python 3.8 or higher
-- [CUDA](https://developer.nvidia.com/cuda-downloads) compatible with PyTorch. Refer to [PyTorch's website](https://pytorch.org/get-started/locally/) for compatibility information.
+- [CUDA](https://developer.nvidia.com/cuda-downloads) is highly recommended for better performance but not necessary. WhisperClip can also run on a CPU.
 
 ### Setting Up the Environment
 
