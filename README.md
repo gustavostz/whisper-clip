@@ -3,6 +3,8 @@
 
 WhisperClip simplifies your life by automatically transcribing audio recordings and saving the text directly to your clipboard. With just a click of a button, you can effortlessly convert spoken words into written text, ready to be pasted wherever you need it. This application harnesses the power of OpenAI's Whisper for free, making transcription more accessible and convenient.
 
+![Example using WhisperClip](./readme_assets/example-of-usage.gif)
+
 ## Features
 
 - Record audio with a simple click.
