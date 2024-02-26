@@ -59,6 +59,10 @@ python main.py
 - Click the microphone button to start and stop recording.
 - If "Save to Clipboard" is checked, the transcription will be copied to your clipboard automatically.
 
+## Feedback
+
+If there's interest in a more user-friendly, executable version of WhisperClip, I'd be happy to consider creating one. Your feedback and suggestions are welcome! Just let me know through the [GitHub issues](https://github.com/gustavostz/whisper-clip/issues).
+
 ## Acknowledgments
 
 This project uses [OpenAI's Whisper](https://github.com/openai/whisper) for audio transcription.
