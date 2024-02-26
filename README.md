@@ -1,7 +1,7 @@
 
 # WhisperClip: One-Click Audio Transcription
 
-![Example using WhisperClip](./readme_assets/example-of-usage.gif)
+![Example using WhisperClip](assets/readme/example-of-usage.gif)
 
 
 WhisperClip simplifies your life by automatically transcribing audio recordings and saving the text directly to your clipboard. With just a click of a button, you can effortlessly convert spoken words into written text, ready to be pasted wherever you need it. This application harnesses the power of OpenAI's Whisper for free, making transcription more accessible and convenient.
@@ -48,7 +48,7 @@ Based on your GPU's VRAM, choose the appropriate Whisper model for optimal perfo
 
 For English-only applications, `.en` models (e.g., `tiny.en`, `base.en`) tend to perform better.
 
-To change the model, modify the `model_name` variable in `whisper_client.py` to the desired model name.
+To change the model, modify the `model_name` variable in `config.json` to the desired model name.
 
 ## Usage
 
