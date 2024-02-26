@@ -23,11 +23,13 @@ WhisperClip simplifies your life by automatically transcribing audio recordings 
 
 1. Clone the repository:
    ```
-   git clone https://github.com/your-username/whisper-clip.git
+   git clone https://github.com/gustavostz/whisper-clip.git
    cd whisper-clip
    ```
 
-2. Install the required dependencies:
+2. Install PyTorch if you don't have it already. Refer to [PyTorch's website](https://pytorch.org/get-started/locally/) for installation instructions.
+
+3. Install the required dependencies:
    ```
    pip install -r requirements.txt
    ```
