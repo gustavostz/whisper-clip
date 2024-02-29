@@ -12,6 +12,7 @@ from whisper_client import WhisperClient
 import keyboard
 from pystray import Icon, MenuItem, Menu
 from PIL import Image
+import winsound
 
 
 class AudioRecorder:
@@ -81,6 +82,8 @@ class AudioRecorder:
                 self.transcription_queue.task_done()
                 if self.save_to_clipboard.get():
                     pyperclip.copy(transcription)
+                    # Play a notification sound
+                    winsound.PlaySound('./assets/saved-on-clipboard-sound.wav', winsound.SND_FILENAME)
             except queue.Empty:
                 continue
 
