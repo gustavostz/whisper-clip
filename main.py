@@ -10,7 +10,15 @@ def main():
     with open('config.json', 'r') as config_file:
         config = json.load(config_file)
 
-    app = AudioRecorder(root, model_name=config['model_name'], shortcut=config['shortcut'])
+    # Set default values for missing keys (if you want to change it, you must change the config.json file, not here)
+    default_config = {
+        'model_name': 'medium.en',
+        'shortcut': 'alt+shift+r',
+        'notify_clipboard_saving': True
+    }
+    config = {**default_config, **config}
+
+    app = AudioRecorder(root, **config)
     root.mainloop()
 
 

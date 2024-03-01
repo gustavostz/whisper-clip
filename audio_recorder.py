@@ -16,7 +16,7 @@ import winsound
 
 
 class AudioRecorder:
-    def __init__(self, master, model_name="medium.en", shortcut="alt+shift+r"):
+    def __init__(self, master, model_name="medium.en", shortcut="alt+shift+r", notify_clipboard_saving=True):
         self.output_folder = "output"
         self.master = master
         self.master.title("WhisperClip")
@@ -29,6 +29,7 @@ class AudioRecorder:
         self.transcriber = WhisperClient(model_name=model_name)
         self.keep_transcribing = True
         self.shortcut = shortcut
+        self.notify_clipboard_saving = notify_clipboard_saving
 
         self.record_button = tk.Button(self.master, text="🎙", command=self.toggle_recording, font=("Arial", 24),
                                        bg="white")
@@ -83,7 +84,8 @@ class AudioRecorder:
                 if self.save_to_clipboard.get():
                     pyperclip.copy(transcription)
                     # Play a notification sound
-                    winsound.PlaySound('./assets/saved-on-clipboard-sound.wav', winsound.SND_FILENAME)
+                    if self.notify_clipboard_saving:
+                        winsound.PlaySound('./assets/saved-on-clipboard-sound.wav', winsound.SND_FILENAME)
             except queue.Empty:
                 continue
 

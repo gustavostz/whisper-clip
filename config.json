@@ -1,4 +1,5 @@
 {
     "model_name": "medium.en",
-    "shortcut": "alt+shift+r"
+    "shortcut": "alt+shift+r",
+    "notify_clipboard_saving": true
 }
