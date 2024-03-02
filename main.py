@@ -12,7 +12,7 @@ def main():
 
     # Set default values for missing keys (if you want to change it, you must change the config.json file, not here)
     default_config = {
-        'model_name': 'medium.en',
+        'model_name': 'medium',
         'shortcut': 'alt+shift+r',
         'notify_clipboard_saving': True
     }
