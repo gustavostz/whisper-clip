@@ -66,13 +66,16 @@ class AudioRecorder:
         self.record_button.config(bg="white")
         sd.stop()
         self.record_thread.join()
-        audio_data = np.concatenate(self.recordings)
-        audio_data = (audio_data * 32767).astype(np.int16)
-        os.makedirs(self.output_folder, exist_ok=True)
-        filename = f"{self.output_folder}/audio_{int(time.time())}.wav"
-        write(filename, 44100, audio_data)
-        self.recordings = []
-        self.transcription_queue.put(filename)
+        if self.recordings:
+            audio_data = np.concatenate(self.recordings)
+            audio_data = (audio_data * 32767).astype(np.int16)
+            os.makedirs(self.output_folder, exist_ok=True)
+            filename = f"{self.output_folder}/audio_{int(time.time())}.wav"
+            write(filename, 44100, audio_data)
+            self.recordings = []
+            self.transcription_queue.put(filename)
+        else:
+            print("No audio data recorded. Please check your audio input device.")
 
     def process_transcriptions(self):
         while self.keep_transcribing:
