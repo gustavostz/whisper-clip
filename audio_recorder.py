@@ -12,11 +12,12 @@ from whisper_client import WhisperClient
 import keyboard
 from pystray import Icon, MenuItem, Menu
 from PIL import Image
-import winsound
+import platform
 
 
 class AudioRecorder:
     def __init__(self, master, model_name="medium.en", shortcut="alt+shift+r", notify_clipboard_saving=True):
+        self.system_platform = platform.system()
         self.output_folder = "output"
         self.master = master
         self.master.title("WhisperClip")
@@ -77,6 +78,18 @@ class AudioRecorder:
         else:
             print("No audio data recorded. Please check your audio input device.")
 
+    def play_notification_sound(self):
+        sound_file = './assets/saved-on-clipboard-sound.wav'
+
+        if self.system_platform == 'Windows':
+            import winsound
+            winsound.PlaySound(sound_file, winsound.SND_FILENAME)
+        elif self.system_platform == 'Darwin':  # MacOS
+            os.system(f'afplay {sound_file}')
+        else:
+            print(f'Unsupported platform. Please open an issue to request support for your operating system. System: '
+                  f'{self.system_platform}')
+
     def process_transcriptions(self):
         while self.keep_transcribing:
             try:
@@ -88,7 +101,7 @@ class AudioRecorder:
                     pyperclip.copy(transcription)
                     # Play a notification sound
                     if self.notify_clipboard_saving:
-                        winsound.PlaySound('./assets/saved-on-clipboard-sound.wav', winsound.SND_FILENAME)
+                        self.play_notification_sound()
             except queue.Empty:
                 continue
 
