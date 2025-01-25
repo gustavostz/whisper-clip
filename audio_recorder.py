@@ -40,7 +40,7 @@ class AudioRecorder:
                                        bg="white")
         self.record_button.pack(expand=True)
 
-        self.save_to_clipboard = tk.BooleanVar(value=False)
+        self.save_to_clipboard = tk.BooleanVar(value=True)
         self.clipboard_checkbox = tk.Checkbutton(self.master, text="Save to Clipboard", variable=self.save_to_clipboard)
         self.clipboard_checkbox.pack()
 
