@@ -9,7 +9,8 @@ import queue
 import time
 import os
 from whisper_client import WhisperClient
-import keyboard
+import pynput.keyboard as keyboard
+from custom_hotkey_listener import HotkeyListener
 from pystray import Icon, MenuItem, Menu
 from PIL import Image
 import platform
@@ -106,6 +107,8 @@ class AudioRecorder:
             winsound.PlaySound(sound_file, winsound.SND_FILENAME)
         elif self.system_platform == 'Darwin':  # MacOS
             os.system(f'afplay {sound_file}')
+        elif self.system_platform == 'Linux':   # Linux
+            os.system(f"paplay {sound_file}")
         else:
             print(f'Unsupported platform. Please open an issue to request support for your operating system. System: '
                   f'{self.system_platform}')
@@ -139,7 +142,7 @@ class AudioRecorder:
         self.master.withdraw()  # Hide the window
 
     def record_audio(self):
-        with sd.InputStream(callback=self.audio_callback):
+        with sd.InputStream(callback=self.audio_callback, channels=1):
             while self.is_recording:
                 sd.sleep(1000)
 
@@ -148,7 +151,13 @@ class AudioRecorder:
 
     def setup_global_shortcut(self):
         # Use the shortcut passed during initialization
-        keyboard.add_hotkey(self.shortcut, self.toggle_recording)
+        # custom implementation for linux system
+        listener = HotkeyListener(self.shortcut, self.toggle_recording)
+        keyboard_listener = keyboard.Listener(
+            on_press=listener.on_press,
+            on_release=listener.on_release
+        )
+        keyboard_listener.start()
 
     def setup_system_tray(self):
         # Load the icon image from a file

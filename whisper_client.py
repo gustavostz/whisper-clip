@@ -1,6 +1,9 @@
 import torch
 import whisper
+import os
 
+# flag to control deleting of newly created files
+DELETE_FILE_AFTER_TRANSCRIPTION = os.getenv("DELETE_FILE_AFTER_TRANSCRIPTION", 'true').lower() == 'true'
 
 class WhisperClient:
     def __init__(self, model_name="medium.en"):
@@ -31,4 +34,9 @@ class WhisperClient:
         if self.model is None:
             self.load_model()
         result = self.model.transcribe(audio_path)
+        print(DELETE_FILE_AFTER_TRANSCRIPTION)
+        # delete file if flag is set
+        if DELETE_FILE_AFTER_TRANSCRIPTION:
+            os.remove(audio_path)
+
         return result["text"]

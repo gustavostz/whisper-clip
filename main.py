@@ -1,7 +1,9 @@
 import tkinter as tk
 from audio_recorder import AudioRecorder
 import json
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def main():
     root = tk.Tk()

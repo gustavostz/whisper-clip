@@ -8,6 +8,9 @@
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
 
+# experimentation notebook used by the author
+exp_notebook.ipynb
+
 # IPython
 profile_default/
 ipython_config.py
