@@ -1,5 +1,5 @@
 {
-    "model_name": "small",
-    "shortcut": "alt+shift+r",
+    "model_name": "medium",
+    "shortcut": "ctrl+win+r",
     "notify_clipboard_saving": true
 }
