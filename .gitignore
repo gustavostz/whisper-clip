@@ -161,6 +161,10 @@ modules.xml
 *.ipr
 
 ### Python ###
+# Claude-specific files
+.claude/
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
