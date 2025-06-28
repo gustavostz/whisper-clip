@@ -86,6 +86,15 @@ class VisualizerManager:
         """Notify visualizer that recording stopped"""
         self.send_command('stop_recording')
         
+    def start_transcription(self):
+        """Notify visualizer that transcription started"""
+        self.send_command('start_transcription')
+        
+        
+    def stop_transcription(self):
+        """Notify visualizer that transcription completed"""
+        self.send_command('stop_transcription')
+        
     def _run_visualizer(self):
         """Run the visualizer in a separate process"""
         if not PYQT5_AVAILABLE:
@@ -112,6 +121,10 @@ class VisualizerManager:
                         visualizer.start_recording()
                     elif command == 'stop_recording':
                         visualizer.stop_recording()
+                    elif command == 'start_transcription':
+                        visualizer.start_transcription()
+                    elif command == 'stop_transcription':
+                        visualizer.stop_transcription()
                     elif command == 'quit':
                         app.quit()
             except:

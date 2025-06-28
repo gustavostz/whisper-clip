@@ -100,7 +100,7 @@ class AudioRecorder:
         sd.stop()
         self.record_thread.join()
         
-        # Stop visualizer
+        # Stop recording in visualizer (it will transition to transcription state)
         self.visualizer_manager.stop_recording()
         
         if self.recordings:
@@ -139,14 +139,21 @@ class AudioRecorder:
                 if loading_thread and loading_thread.is_alive():
                     self.model_ready.wait()  # Wait for model loading to complete
                 
+                # Show transcription progress
+                self.visualizer_manager.start_transcription()
+                
+                # Transcribe
                 transcription = self.transcriber.transcribe(filename)
-                print(f"Transcription for {filename}:", transcription)
                 self.transcription_queue.task_done()
+                
+                # Show success animation first
+                self.visualizer_manager.stop_transcription()
                 
                 if self.save_to_clipboard.get():
                     pyperclip.copy(transcription)
                     if self.notify_clipboard_saving:
-                        self.play_notification_sound()
+                        # Delay audio notification to sync with visual feedback
+                        threading.Timer(0.3, self.play_notification_sound).start()
                 
                 # Unload model after transcription is complete
                 self.transcriber.unload_model()
