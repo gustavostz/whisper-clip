@@ -30,5 +30,8 @@ class WhisperClient:
     def transcribe(self, audio_path):
         if self.model is None:
             self.load_model()
+        
+        # Run transcription
         result = self.model.transcribe(audio_path)
+        
         return result["text"]
