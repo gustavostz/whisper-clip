@@ -1,5 +1,6 @@
 {
     "model_name": "small",
     "shortcut": "alt+shift+r",
-    "notify_clipboard_saving": true
+    "notify_clipboard_saving": true,
+    "llm_context_prefix": true
 }

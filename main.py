@@ -14,7 +14,8 @@ def main():
     default_config = {
         'model_name': 'medium',
         'shortcut': 'alt+shift+r',
-        'notify_clipboard_saving': True
+        'notify_clipboard_saving': True,
+        'llm_context_prefix': True
     }
     config = {**default_config, **config}
 
