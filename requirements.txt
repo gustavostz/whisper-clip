@@ -1,32 +1,14 @@
-﻿certifi==2024.2.2
-cffi==1.16.0
-charset-normalizer==3.3.2
-colorama==0.4.6
-filelock==3.9.0
-fsspec==2023.4.0
-idna==3.6
-Jinja2==3.1.2
-llvmlite==0.42.0
-MarkupSafe==2.1.3
-more-itertools==10.2.0
-mpmath==1.3.0
-networkx==3.2.1
-numba==0.59.0
-numpy==1.26.3
-openai-whisper==20231117
-pillow==10.2.0
-pycparser==2.21
-pyperclip==1.8.2
-regex==2023.12.25
-requests==2.31.0
-scipy==1.12.0
-sounddevice==0.4.6
-sympy==1.12
-tiktoken==0.6.0
-tqdm==4.66.2
-typing_extensions==4.8.0
-urllib3==2.2.1
+faster-whisper>=1.1.0
+numpy>=1.26.0
+scipy>=1.12.0
+sounddevice>=0.4.6
+pyperclip>=1.8.2
+keyboard>=0.13.5
+pystray>=0.19.5
+pillow>=10.2.0
+PyQt5>=5.15.11
 
-keyboard~=0.13.5
-pystray~=0.19.5
-PyQt5==5.15.11
+# Windows CUDA support (GPU acceleration)
+nvidia-cudnn-cu12; sys_platform == "win32"
+nvidia-cublas-cu12; sys_platform == "win32"
+nvidia-cuda-runtime-cu12; sys_platform == "win32"

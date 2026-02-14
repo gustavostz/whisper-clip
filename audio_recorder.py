@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 import pyperclip
 import sounddevice as sd
 import numpy as np
@@ -18,7 +18,7 @@ from visualizer_manager import VisualizerManager
 
 
 class AudioRecorder:
-    def __init__(self, master, model_name="medium.en", shortcut="alt+shift+r", notify_clipboard_saving=True, llm_context_prefix=True):
+    def __init__(self, master, model_name="turbo", shortcut="alt+shift+r", notify_clipboard_saving=True, llm_context_prefix=True, compute_type="int8"):
         self.system_platform = platform.system()
         self.output_folder = "output"
         self.master = master
@@ -29,7 +29,7 @@ class AudioRecorder:
         self.is_recording = False
         self.recordings = []
         self.transcription_queue = queue.Queue()
-        self.transcriber = WhisperClient(model_name=model_name)
+        self.transcriber = WhisperClient(model_name=model_name, compute_type=compute_type)
         self.keep_transcribing = True
         self.shortcut = shortcut
         self.notify_clipboard_saving = notify_clipboard_saving
@@ -122,8 +122,12 @@ class AudioRecorder:
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_model_async(self):
-        self.transcriber.load_model()
-        self.model_ready.set()
+        try:
+            self.transcriber.load_model()
+        except Exception as e:
+            print(f"Model loading failed: {e}")
+        finally:
+            self.model_ready.set()
 
     def toggle_recording(self):
         if self.is_recording:
@@ -187,32 +191,36 @@ class AudioRecorder:
         while self.keep_transcribing:
             try:
                 filename, loading_thread = self.transcription_queue.get(timeout=1)
-                
-                # Wait for model to be ready if it's still loading
-                if loading_thread and loading_thread.is_alive():
-                    self.model_ready.wait()  # Wait for model loading to complete
-                
-                # Show transcription progress
-                self.visualizer_manager.start_transcription()
-                
-                # Transcribe
-                transcription = self.transcriber.transcribe(filename)
-                self.transcription_queue.task_done()
-                
-                # Show success animation first
-                self.visualizer_manager.stop_transcription()
-                
-                if self.save_to_clipboard.get():
-                    if self.llm_context_prefix.get():
-                        transcription = "[Transcribed via speech-to-text (Whisper). Some words may be inaccurate — please interpret based on context.]\n\n" + transcription
-                    pyperclip.copy(transcription)
-                    if self.notify_clipboard_saving:
-                        # Delay audio notification to sync with visual feedback
-                        threading.Timer(0.3, self.play_notification_sound).start()
-                
-                # Unload model after transcription is complete
-                self.transcriber.unload_model()
-                self.model_ready.clear()
+
+                try:
+                    # Wait for model to be ready if it's still loading
+                    if loading_thread and loading_thread.is_alive():
+                        self.model_ready.wait()  # Wait for model loading to complete
+
+                    # Show transcription progress
+                    self.visualizer_manager.start_transcription()
+
+                    # Transcribe
+                    transcription = self.transcriber.transcribe(filename)
+                    self.transcription_queue.task_done()
+
+                    # Show success animation first
+                    self.visualizer_manager.stop_transcription()
+
+                    if self.save_to_clipboard.get():
+                        if self.llm_context_prefix.get():
+                            transcription = "[Transcribed via speech-to-text (Whisper). Some words may be inaccurate — please interpret based on context.]\n\n" + transcription
+                        pyperclip.copy(transcription)
+                        if self.notify_clipboard_saving:
+                            # Delay audio notification to sync with visual feedback
+                            threading.Timer(0.3, self.play_notification_sound).start()
+                except Exception as e:
+                    print(f"Transcription error: {e}")
+                    self.visualizer_manager.stop_transcription()
+                finally:
+                    # Unload model after transcription is complete
+                    self.transcriber.unload_model()
+                    self.model_ready.clear()
                 
             except queue.Empty:
                 continue
