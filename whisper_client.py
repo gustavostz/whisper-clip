@@ -1,6 +1,7 @@
 import gc
 import logging
 import time
+import threading
 
 log = logging.getLogger("whisperclip")
 
@@ -10,43 +11,42 @@ class WhisperClient:
         self.model_name = model_name
         self.compute_type = compute_type
         self.model = None
+        self._lock = threading.Lock()
 
     def load_model(self):
-        if self.model is None:
-            from faster_whisper import WhisperModel
-            import ctranslate2
+        with self._lock:
+            if self.model is None:
+                from faster_whisper import WhisperModel
+                import ctranslate2
 
-            cuda_types = ctranslate2.get_supported_compute_types("cuda")
+                cuda_types = ctranslate2.get_supported_compute_types("cuda")
 
-            if len(cuda_types) > 0:
-                log.info("Loading model '%s' on CUDA (compute_type=%s)",
-                         self.model_name, self.compute_type)
-                self.model = WhisperModel(
-                    self.model_name,
-                    device="cuda",
-                    compute_type=self.compute_type,
-                )
-            else:
-                log.info("Loading model '%s' on CPU (CUDA not available)", self.model_name)
-                self.model = WhisperModel(
-                    self.model_name,
-                    device="cpu",
-                    compute_type="int8",
-                )
+                if len(cuda_types) > 0:
+                    log.info("Loading model '%s' on CUDA (compute_type=%s)",
+                             self.model_name, self.compute_type)
+                    self.model = WhisperModel(
+                        self.model_name,
+                        device="cuda",
+                        compute_type=self.compute_type,
+                    )
+                else:
+                    log.info("Loading model '%s' on CPU (CUDA not available)", self.model_name)
+                    self.model = WhisperModel(
+                        self.model_name,
+                        device="cpu",
+                        compute_type="int8",
+                    )
 
     def unload_model(self):
-        if self.model is not None:
-            del self.model
-            self.model = None
-            gc.collect()
-            log.debug("Model unloaded")
-
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
+        with self._lock:
+            if self.model is not None:
+                del self.model
+                self.model = None
+                gc.collect()
+                # Don't call torch.cuda.empty_cache() — CTranslate2 manages its own
+                # CUDA memory. Calling empty_cache() from PyTorch interferes with
+                # CTranslate2's CUDA context and causes segfaults on rapid load/unload cycles.
+                log.debug("Model unloaded")
 
     def transcribe(self, audio_path):
         if self.model is None:

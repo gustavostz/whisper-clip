@@ -36,10 +36,6 @@ class AudioRecorder:
         self.keep_transcribing = True
         self.shortcut = shortcut
         self.notify_clipboard_saving = notify_clipboard_saving
-
-        # Add thread management
-        self.model_loading_thread = None
-        self.model_ready = threading.Event()
         self._toggle_lock = threading.Lock()
 
         # Initialize visualizer manager
@@ -128,15 +124,14 @@ class AudioRecorder:
         log.info("WhisperClip started (model=%s, compute_type=%s, shortcut=%s)",
                  model_name, compute_type, shortcut)
 
-    def load_model_async(self):
-        log.debug("Model loading started")
+    def _preload_model(self):
+        """Pre-load model in background thread to reduce latency after recording stops."""
+        log.debug("Model pre-loading started")
         try:
             self.transcriber.load_model()
-            log.debug("Model loading finished")
+            log.debug("Model pre-loading finished")
         except Exception as e:
-            log.error("Model loading failed: %s", e, exc_info=True)
-        finally:
-            self.model_ready.set()
+            log.error("Model pre-loading failed: %s", e, exc_info=True)
 
     def toggle_recording(self):
         # Run in a separate thread to avoid blocking the keyboard hook
@@ -163,10 +158,10 @@ class AudioRecorder:
         # Show visualizer in loading state immediately
         self.visualizer_manager.start_loading()
 
-        # Start model loading in parallel
-        self.model_ready.clear()
-        self.model_loading_thread = threading.Thread(target=self.load_model_async)
-        self.model_loading_thread.start()
+        # Pre-load model in background to reduce latency when transcription starts.
+        # The lock in WhisperClient prevents conflicts if model is already loaded
+        # or being unloaded by the transcription thread.
+        threading.Thread(target=self._preload_model, daemon=True).start()
 
         # Start recording immediately
         self.record_thread = threading.Thread(target=self.record_audio)
@@ -190,13 +185,9 @@ class AudioRecorder:
             write(filename, 44100, audio_data)
             self.recordings = []
             log.info("Audio saved: %s", filename)
-            self.transcription_queue.put((filename, self.model_loading_thread))
+            self.transcription_queue.put(filename)
         else:
             log.warning("No audio data recorded. Check your audio input device.")
-            # If no audio was recorded, wait for model loading and unload it
-            if self.model_loading_thread and self.model_loading_thread.is_alive():
-                self.model_loading_thread.join()
-                self.transcriber.unload_model()
 
     def play_notification_sound(self):
         sound_file = './assets/saved-on-clipboard-sound.wav'
@@ -212,18 +203,13 @@ class AudioRecorder:
     def process_transcriptions(self):
         while self.keep_transcribing:
             try:
-                filename, loading_thread = self.transcription_queue.get(timeout=1)
+                filename = self.transcription_queue.get(timeout=1)
 
                 try:
-                    # Wait for model to be ready if it's still loading
-                    if loading_thread and loading_thread.is_alive():
-                        log.debug("Waiting for model to finish loading...")
-                        self.model_ready.wait()
-
                     # Show transcription progress
                     self.visualizer_manager.start_transcription()
 
-                    # Transcribe
+                    # Transcribe (loads model internally if not already loaded)
                     log.info("Transcribing: %s", filename)
                     transcription = self.transcriber.transcribe(filename)
                     self.transcription_queue.task_done()
@@ -244,9 +230,8 @@ class AudioRecorder:
                     log.error("Transcription error: %s", e, exc_info=True)
                     self.visualizer_manager.stop_transcription()
                 finally:
-                    # Unload model after transcription is complete
+                    # Unload model after transcription to free GPU memory
                     self.transcriber.unload_model()
-                    self.model_ready.clear()
 
             except queue.Empty:
                 continue
@@ -373,17 +358,15 @@ class AudioRecorder:
             if result:
                 log.info("File selected for transcription: %s", file_path)
 
-                # Start model loading
-                self.model_ready.clear()
-                self.model_loading_thread = threading.Thread(target=self.load_model_async)
-                self.model_loading_thread.start()
+                # Pre-load model
+                threading.Thread(target=self._preload_model, daemon=True).start()
 
                 # Show visualizer in transcription state
                 self.visualizer_manager.start_loading()
                 threading.Timer(1.0, self.visualizer_manager.start_transcription).start()
 
                 # Add to transcription queue
-                self.transcription_queue.put((file_path, self.model_loading_thread))
+                self.transcription_queue.put(file_path)
 
                 # Show success message
                 messagebox.showinfo(
