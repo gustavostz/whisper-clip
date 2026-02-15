@@ -37,6 +37,7 @@ class AudioRecorder:
         # Add thread management
         self.model_loading_thread = None
         self.model_ready = threading.Event()
+        self._toggle_lock = threading.Lock()
         
         # Initialize visualizer manager
         self.visualizer_manager = VisualizerManager()
@@ -130,10 +131,20 @@ class AudioRecorder:
             self.model_ready.set()
 
     def toggle_recording(self):
-        if self.is_recording:
-            self.stop_recording()
-        else:
-            self.start_recording()
+        # Run in a separate thread to avoid blocking the keyboard hook
+        # (Windows unhooks low-level keyboard hooks that take too long)
+        threading.Thread(target=self._toggle_recording, daemon=True).start()
+
+    def _toggle_recording(self):
+        if not self._toggle_lock.acquire(blocking=False):
+            return  # Already toggling, ignore duplicate
+        try:
+            if self.is_recording:
+                self.stop_recording()
+            else:
+                self.start_recording()
+        finally:
+            self._toggle_lock.release()
 
     def start_recording(self):
         self.is_recording = True
@@ -195,7 +206,7 @@ class AudioRecorder:
                 try:
                     # Wait for model to be ready if it's still loading
                     if loading_thread and loading_thread.is_alive():
-                        self.model_ready.wait()  # Wait for model loading to complete
+                        self.model_ready.wait()
 
                     # Show transcription progress
                     self.visualizer_manager.start_transcription()
@@ -215,14 +226,18 @@ class AudioRecorder:
                             # Delay audio notification to sync with visual feedback
                             threading.Timer(0.3, self.play_notification_sound).start()
                 except Exception as e:
-                    print(f"Transcription error: {e}")
+                    print(f"[WhisperClip] Transcription error: {e}")
                     self.visualizer_manager.stop_transcription()
                 finally:
                     # Unload model after transcription is complete
                     self.transcriber.unload_model()
                     self.model_ready.clear()
-                
+
             except queue.Empty:
+                continue
+            except Exception as e:
+                # Catch-all so the transcription thread never dies silently
+                print(f"[WhisperClip] Unexpected error in transcription thread: {e}")
                 continue
                 
     def process_audio_levels(self):
