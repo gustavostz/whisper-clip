@@ -1,4 +1,8 @@
 import gc
+import logging
+import time
+
+log = logging.getLogger("whisperclip")
 
 
 class WhisperClient:
@@ -15,12 +19,15 @@ class WhisperClient:
             cuda_types = ctranslate2.get_supported_compute_types("cuda")
 
             if len(cuda_types) > 0:
+                log.info("Loading model '%s' on CUDA (compute_type=%s)",
+                         self.model_name, self.compute_type)
                 self.model = WhisperModel(
                     self.model_name,
                     device="cuda",
                     compute_type=self.compute_type,
                 )
             else:
+                log.info("Loading model '%s' on CPU (CUDA not available)", self.model_name)
                 self.model = WhisperModel(
                     self.model_name,
                     device="cpu",
@@ -32,6 +39,7 @@ class WhisperClient:
             del self.model
             self.model = None
             gc.collect()
+            log.debug("Model unloaded")
 
             try:
                 import torch
@@ -44,9 +52,13 @@ class WhisperClient:
         if self.model is None:
             self.load_model()
 
+        start = time.perf_counter()
         segments, _info = self.model.transcribe(
             audio_path,
             beam_size=5,
         )
 
-        return " ".join(segment.text.strip() for segment in segments)
+        text = " ".join(segment.text.strip() for segment in segments)
+        elapsed = time.perf_counter() - start
+        log.info("Transcription took %.1fs (%d chars)", elapsed, len(text))
+        return text

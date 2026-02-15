@@ -26,13 +26,57 @@ if sys.platform == "win32":
                 os.add_dll_directory(_path)
 
 import tkinter as tk
-from audio_recorder import AudioRecorder
 import json
+import logging
+import threading
+from datetime import datetime
+
+
+def setup_logging(enabled):
+    """Configure logging to file and console. No-op when disabled."""
+    logger = logging.getLogger("whisperclip")
+    logger.setLevel(logging.DEBUG)
+
+    if not enabled:
+        logger.addHandler(logging.NullHandler())
+        return
+
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    # File handler (one file per day)
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"whisper-clip_{datetime.now():%Y-%m-%d}.log")
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    # Catch unhandled exceptions
+    def handle_exception(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = handle_exception
+
+    def handle_thread_exception(args):
+        logger.critical("Unhandled exception in thread '%s'", args.thread.name,
+                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    threading.excepthook = handle_thread_exception
+
+    logger.info("Logging initialized — log file: %s", log_file)
 
 
 def main():
-    root = tk.Tk()
-
     # Load configurations from the config file
     with open('config.json', 'r') as config_file:
         config = json.load(config_file)
@@ -44,9 +88,15 @@ def main():
         'notify_clipboard_saving': True,
         'llm_context_prefix': True,
         'compute_type': 'int8',
+        'debug_logs': False,
     }
     config = {**default_config, **config}
 
+    setup_logging(config.pop('debug_logs'))
+
+    from audio_recorder import AudioRecorder
+
+    root = tk.Tk()
     app = AudioRecorder(root, **config)
     root.mainloop()
 

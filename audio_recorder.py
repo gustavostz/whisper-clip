@@ -8,6 +8,7 @@ import threading
 import queue
 import time
 import os
+import logging
 from datetime import datetime
 from whisper_client import WhisperClient
 import keyboard
@@ -15,6 +16,8 @@ from pystray import Icon, MenuItem, Menu
 from PIL import Image
 import platform
 from visualizer_manager import VisualizerManager
+
+log = logging.getLogger("whisperclip")
 
 
 class AudioRecorder:
@@ -33,17 +36,17 @@ class AudioRecorder:
         self.keep_transcribing = True
         self.shortcut = shortcut
         self.notify_clipboard_saving = notify_clipboard_saving
-        
+
         # Add thread management
         self.model_loading_thread = None
         self.model_ready = threading.Event()
         self._toggle_lock = threading.Lock()
-        
+
         # Initialize visualizer manager
         self.visualizer_manager = VisualizerManager()
         self.audio_level_thread = None
         self.audio_level_queue = queue.Queue(maxsize=100)
-        
+
         # Pre-start the visualizer process so it's ready immediately
         self.visualizer_manager.start()
 
@@ -56,7 +59,7 @@ class AudioRecorder:
         top_frame.pack(fill=tk.X, padx=5, pady=(5, 0))
 
         # File selection button - positioned in the top-right corner
-        self.file_button = tk.Button(top_frame, text="📁", command=self.select_audio_file,
+        self.file_button = tk.Button(top_frame, text="\U0001f4c1", command=self.select_audio_file,
                                     font=("Arial", 12), bg="#f0f0f0", fg="#666",
                                     relief=tk.FLAT, cursor="hand2", padx=5, pady=2)
         self.file_button.pack(side=tk.RIGHT)
@@ -88,7 +91,7 @@ class AudioRecorder:
         center_frame = tk.Frame(main_frame, bg="white")
         center_frame.pack(expand=True, fill=tk.BOTH)
 
-        self.record_button = tk.Button(center_frame, text="🎙", command=self.toggle_recording,
+        self.record_button = tk.Button(center_frame, text="\U0001f399", command=self.toggle_recording,
                                       font=("Arial", 24), bg="white", relief=tk.RAISED,
                                       cursor="hand2")
         self.record_button.pack(expand=True)
@@ -109,7 +112,7 @@ class AudioRecorder:
 
         self.transcription_thread = threading.Thread(target=self.process_transcriptions)
         self.transcription_thread.start()
-        
+
         # Start audio level processing thread
         self.audio_level_thread = threading.Thread(target=self.process_audio_levels)
         self.audio_level_thread.daemon = True
@@ -122,11 +125,16 @@ class AudioRecorder:
         # Stop all processes when the window is closed
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        log.info("WhisperClip started (model=%s, compute_type=%s, shortcut=%s)",
+                 model_name, compute_type, shortcut)
+
     def load_model_async(self):
+        log.debug("Model loading started")
         try:
             self.transcriber.load_model()
+            log.debug("Model loading finished")
         except Exception as e:
-            print(f"Model loading failed: {e}")
+            log.error("Model loading failed: %s", e, exc_info=True)
         finally:
             self.model_ready.set()
 
@@ -137,7 +145,8 @@ class AudioRecorder:
 
     def _toggle_recording(self):
         if not self._toggle_lock.acquire(blocking=False):
-            return  # Already toggling, ignore duplicate
+            log.debug("Toggle ignored — already in progress")
+            return
         try:
             if self.is_recording:
                 self.stop_recording()
@@ -147,17 +156,18 @@ class AudioRecorder:
             self._toggle_lock.release()
 
     def start_recording(self):
+        log.info("Recording started")
         self.is_recording = True
         self.record_button.config(bg="red")
-        
+
         # Show visualizer in loading state immediately
         self.visualizer_manager.start_loading()
-        
+
         # Start model loading in parallel
         self.model_ready.clear()
         self.model_loading_thread = threading.Thread(target=self.load_model_async)
         self.model_loading_thread.start()
-        
+
         # Start recording immediately
         self.record_thread = threading.Thread(target=self.record_audio)
         self.record_thread.start()
@@ -167,10 +177,11 @@ class AudioRecorder:
         self.record_button.config(bg="white")
         sd.stop()
         self.record_thread.join()
-        
+        log.info("Recording stopped")
+
         # Stop recording in visualizer (it will transition to transcription state)
         self.visualizer_manager.stop_recording()
-        
+
         if self.recordings:
             audio_data = np.concatenate(self.recordings)
             audio_data = (audio_data * 32767).astype(np.int16)
@@ -178,9 +189,10 @@ class AudioRecorder:
             filename = f"{self.output_folder}/audio_{int(time.time())}.wav"
             write(filename, 44100, audio_data)
             self.recordings = []
+            log.info("Audio saved: %s", filename)
             self.transcription_queue.put((filename, self.model_loading_thread))
         else:
-            print("No audio data recorded. Please check your audio input device.")
+            log.warning("No audio data recorded. Check your audio input device.")
             # If no audio was recorded, wait for model loading and unload it
             if self.model_loading_thread and self.model_loading_thread.is_alive():
                 self.model_loading_thread.join()
@@ -195,8 +207,7 @@ class AudioRecorder:
         elif self.system_platform == 'Darwin':  # MacOS
             os.system(f'afplay {sound_file}')
         else:
-            print(f'Unsupported platform. Please open an issue to request support for your operating system. System: '
-                  f'{self.system_platform}')
+            log.warning("Unsupported platform for notification sound: %s", self.system_platform)
 
     def process_transcriptions(self):
         while self.keep_transcribing:
@@ -206,27 +217,31 @@ class AudioRecorder:
                 try:
                     # Wait for model to be ready if it's still loading
                     if loading_thread and loading_thread.is_alive():
+                        log.debug("Waiting for model to finish loading...")
                         self.model_ready.wait()
 
                     # Show transcription progress
                     self.visualizer_manager.start_transcription()
 
                     # Transcribe
+                    log.info("Transcribing: %s", filename)
                     transcription = self.transcriber.transcribe(filename)
                     self.transcription_queue.task_done()
+                    log.info("Transcription complete (%d chars)", len(transcription))
 
                     # Show success animation first
                     self.visualizer_manager.stop_transcription()
 
                     if self.save_to_clipboard.get():
                         if self.llm_context_prefix.get():
-                            transcription = "[Transcribed via speech-to-text (Whisper). Some words may be inaccurate — please interpret based on context.]\n\n" + transcription
+                            transcription = "[Transcribed via speech-to-text (Whisper). Some words may be inaccurate \u2014 please interpret based on context.]\n\n" + transcription
                         pyperclip.copy(transcription)
+                        log.debug("Transcription copied to clipboard")
                         if self.notify_clipboard_saving:
                             # Delay audio notification to sync with visual feedback
                             threading.Timer(0.3, self.play_notification_sound).start()
                 except Exception as e:
-                    print(f"[WhisperClip] Transcription error: {e}")
+                    log.error("Transcription error: %s", e, exc_info=True)
                     self.visualizer_manager.stop_transcription()
                 finally:
                     # Unload model after transcription is complete
@@ -237,9 +252,9 @@ class AudioRecorder:
                 continue
             except Exception as e:
                 # Catch-all so the transcription thread never dies silently
-                print(f"[WhisperClip] Unexpected error in transcription thread: {e}")
+                log.critical("Unexpected error in transcription thread: %s", e, exc_info=True)
                 continue
-                
+
     def process_audio_levels(self):
         """Process audio levels and send to visualizer"""
         while True:
@@ -250,19 +265,20 @@ class AudioRecorder:
                 continue
 
     def on_close(self):
+        log.debug("Window closed (hidden to tray)")
         self.master.withdraw()  # Hide the window
 
     def record_audio(self):
         # Transition visualizer from loading to recording state
         self.visualizer_manager.start_recording()
-        
+
         with sd.InputStream(callback=self.audio_callback):
             while self.is_recording:
                 sd.sleep(1000)
 
     def audio_callback(self, indata, frames, time, status):
         self.recordings.append(indata.copy())
-        
+
         # Calculate RMS (Root Mean Square) for audio level
         if self.is_recording and len(indata) > 0:
             # Calculate RMS level
@@ -271,7 +287,7 @@ class AudioRecorder:
             db = 20 * np.log10(rms + 1e-10)  # Add small value to avoid log(0)
             normalized_level = (db + 60) / 60  # Normalize to 0-1 range
             normalized_level = max(0.0, min(1.0, normalized_level))
-            
+
             # Send level to visualizer thread
             try:
                 self.audio_level_queue.put_nowait(normalized_level)
@@ -302,6 +318,7 @@ class AudioRecorder:
         self.master.deiconify()
 
     def exit_application(self):
+        log.info("Application exiting")
         self.keep_transcribing = False
         self.transcription_thread.join()
         self.visualizer_manager.stop()
@@ -343,7 +360,7 @@ class AudioRecorder:
                     timestamp = int(timestamp_str)
                     readable_time = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
                     timestamp_info = f" (Recorded: {readable_time})"
-                except:
+                except Exception:
                     pass  # If parsing fails, just continue without timestamp info
 
             # Show confirmation
@@ -354,6 +371,8 @@ class AudioRecorder:
             )
 
             if result:
+                log.info("File selected for transcription: %s", file_path)
+
                 # Start model loading
                 self.model_ready.clear()
                 self.model_loading_thread = threading.Thread(target=self.load_model_async)

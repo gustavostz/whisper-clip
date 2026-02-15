@@ -1,7 +1,10 @@
 import sys
 import time
+import logging
 import importlib.util
 from multiprocessing import Process, Queue as MPQueue
+
+log = logging.getLogger("whisperclip")
 
 # Check if PyQt5 is installed WITHOUT importing it (importing PyQt5 + tkinter
 # in the same process causes a segfault when CTranslate2 initializes CUDA)
@@ -23,6 +26,7 @@ class VisualizerManager:
             return
 
         if self.process is None or not self.process.is_alive():
+            log.debug("Starting visualizer process")
             self.process = Process(target=self._run_visualizer)
             self.process.daemon = True
             self.process.start()
@@ -35,6 +39,7 @@ class VisualizerManager:
             return
 
         if self.process and self.process.is_alive():
+            log.debug("Stopping visualizer process")
             self.send_command('quit')
             self.process.join(timeout=2)
             if self.process.is_alive():

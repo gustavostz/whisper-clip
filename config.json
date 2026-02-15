@@ -3,5 +3,6 @@
     "shortcut": "alt+shift+r",
     "notify_clipboard_saving": true,
     "llm_context_prefix": true,
-    "compute_type": "int8"
+    "compute_type": "int8",
+    "debug_logs": false
 }
