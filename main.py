@@ -77,26 +77,41 @@ def setup_logging(enabled):
 
 
 def _start_server(whisper_client, port, api_key, llm_context_prefix_default):
-    """Start the FastAPI server in a daemon thread."""
-    import uvicorn
-    from server import create_app
+    """Start the FastAPI server in a daemon thread.
 
-    fastapi_app = create_app(whisper_client, api_key, llm_context_prefix_default)
+    Errors are logged but never propagated — the desktop app keeps running
+    even if the server fails to start (e.g. missing dependencies).
+    """
+    log = logging.getLogger("whisperclip")
+    try:
+        import uvicorn
+        from server import create_app
+    except ImportError as e:
+        log.error(
+            "Cannot start API server — missing dependency: %s. "
+            "Install with: pip install fastapi uvicorn[standard] python-multipart", e
+        )
+        return
 
-    uvi_config = uvicorn.Config(
-        app=fastapi_app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-    )
-    server = uvicorn.Server(uvi_config)
-    # Signals must be handled on the main thread (Tkinter), not here
-    server.install_signal_handlers = lambda: None
+    try:
+        fastapi_app = create_app(whisper_client, api_key, llm_context_prefix_default)
 
-    thread = threading.Thread(target=server.run, name="api-server", daemon=True)
-    thread.start()
+        uvi_config = uvicorn.Config(
+            app=fastapi_app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+        )
+        server = uvicorn.Server(uvi_config)
+        # Signals must be handled on the main thread (Tkinter), not here
+        server.install_signal_handlers = lambda: None
 
-    logging.getLogger("whisperclip").info("API server started on 0.0.0.0:%d", port)
+        thread = threading.Thread(target=server.run, name="api-server", daemon=True)
+        thread.start()
+
+        log.info("API server started on 0.0.0.0:%d", port)
+    except Exception as e:
+        log.error("Failed to start API server: %s", e, exc_info=True)
 
 
 def main():
