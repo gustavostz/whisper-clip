@@ -3,7 +3,6 @@
 Started as a daemon thread from main.py when server_enabled=True.
 Shares a WhisperClient instance with the desktop app.
 """
-import asyncio
 import os
 import secrets
 import tempfile
@@ -37,7 +36,7 @@ def create_app(whisper_client, api_key, llm_context_prefix_default=True):
         }
 
     @app.post("/api/v1/transcribe")
-    async def transcribe(
+    def transcribe(
         file: UploadFile = File(...),
         llm_context_prefix: bool | None = Query(None),
         x_api_key: str | None = Header(None),
@@ -51,18 +50,15 @@ def create_app(whisper_client, api_key, llm_context_prefix_default=True):
         try:
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=_get_temp_dir()) as tmp:
                 tmp_path = tmp.name
-                contents = await file.read()
+                contents = file.file.read()
                 tmp.write(contents)
 
             log.info("Server: transcribing upload (%d bytes, %s)", len(contents), file.filename)
 
-            # Run transcription in thread pool to not block the async loop
-            text, metadata = await asyncio.to_thread(
-                whisper_client.transcribe_with_info, tmp_path
-            )
+            text, metadata = whisper_client.transcribe_with_info(tmp_path)
 
             # Unload model after request (same pattern as desktop)
-            await asyncio.to_thread(whisper_client.unload_model)
+            whisper_client.unload_model()
 
             # Apply LLM prefix based on request param or config default
             use_prefix = llm_context_prefix if llm_context_prefix is not None else llm_context_prefix_default
