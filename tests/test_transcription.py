@@ -57,15 +57,18 @@ class TestModelLifecycle:
     """Test model loading, unloading, and reloading."""
 
     def test_load_unload_cycle(self):
-        """Model should load and unload cleanly."""
+        """Model should load and unload GPU memory cleanly."""
         client = WhisperClient(model_name="tiny", compute_type="int8")
         assert client.model is None
 
         client.load_model()
         assert client.model is not None
+        assert client.model.model.model_is_loaded
 
         client.unload_model()
-        assert client.model is None
+        # Model object stays alive but weights are released from GPU
+        assert client.model is not None
+        assert not client.model.model.model_is_loaded
 
     def test_double_load_is_noop(self):
         """Loading an already-loaded model should be safe."""
@@ -84,10 +87,10 @@ class TestModelLifecycle:
         client.load_model()
 
         client.unload_model()
-        assert client.model is None
+        assert not client.model.model.model_is_loaded
 
         client.unload_model()  # Should not crash
-        assert client.model is None
+        assert not client.model.model.model_is_loaded
 
     def test_rapid_load_unload_cycles(self, small_audio):
         """Rapid load/unload cycles should not corrupt CUDA state."""
@@ -110,7 +113,20 @@ class TestModelLifecycle:
         result = client.transcribe(small_audio)
         assert len(result.strip()) > 0
         assert client.model is not None
+        assert client.model.model.model_is_loaded
 
+        client.unload_model()
+
+    def test_transcribe_after_unload_reloads(self, small_audio):
+        """Transcribing after unload should automatically reload weights."""
+        client = WhisperClient(model_name="tiny", compute_type="int8")
+        client.load_model()
+        client.unload_model()
+        assert not client.model.model.model_is_loaded
+
+        result = client.transcribe(small_audio)
+        assert len(result.strip()) > 0
+        assert client.model.model.model_is_loaded
         client.unload_model()
 
 

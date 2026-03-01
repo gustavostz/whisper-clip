@@ -1,9 +1,26 @@
 import os
 import sys
+import site
+from pathlib import Path
 import pytest
 
 # Add project root to path so we can import whisper_client
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Register NVIDIA DLL paths on Windows (same as main.py)
+if sys.platform == "win32":
+    _nvidia_dirs = [
+        Path(sys.prefix) / "Lib" / "site-packages" / "nvidia",
+        Path(site.getusersitepackages()) / "nvidia",
+    ]
+    for _nvidia_dir in _nvidia_dirs:
+        if _nvidia_dir.is_dir():
+            for _pkg in _nvidia_dir.iterdir():
+                _bin = _pkg / "bin"
+                if _bin.is_dir():
+                    os.environ["PATH"] = str(_bin) + os.pathsep + os.environ.get("PATH", "")
+                    if hasattr(os, "add_dll_directory"):
+                        os.add_dll_directory(str(_bin))
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 
