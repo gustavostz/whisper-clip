@@ -792,6 +792,10 @@ FodyWeavers.xsd
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pycharm+iml,venv,visualstudio,visualstudiocode,sublimetext,jupyternotebooks,pycharm+all
 
+# Config file (contains API key)
+config.json
+
 # Avoid sending your audio files to the repository
 output/*.wav
 output/*.mp3
+output/tmp/

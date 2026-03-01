@@ -10,7 +10,7 @@ class WhisperClient:
         self.model_name = model_name
         self.compute_type = compute_type
         self.model = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def load_model(self):
         with self._lock:
@@ -55,19 +55,47 @@ class WhisperClient:
                 log.debug("Model unloaded from GPU")
 
     def transcribe(self, audio_path):
-        if self.model is None or not self.model.model.model_is_loaded:
-            self.load_model()
+        with self._lock:
+            if self.model is None or not self.model.model.model_is_loaded:
+                self.load_model()
 
-        start = time.perf_counter()
-        segments, _info = self.model.transcribe(
-            audio_path,
-            beam_size=5,
-            condition_on_previous_text=False,
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=3,
-        )
+            start = time.perf_counter()
+            segments, _info = self.model.transcribe(
+                audio_path,
+                beam_size=5,
+                condition_on_previous_text=False,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+            )
 
-        text = " ".join(segment.text.strip() for segment in segments)
-        elapsed = time.perf_counter() - start
-        log.info("Transcription took %.1fs (%d chars)", elapsed, len(text))
-        return text
+            text = " ".join(segment.text.strip() for segment in segments)
+            elapsed = time.perf_counter() - start
+            log.info("Transcription took %.1fs (%d chars)", elapsed, len(text))
+            return text
+
+    def transcribe_with_info(self, audio_path):
+        """Transcribe and return (text, metadata_dict). Thread-safe for concurrent access."""
+        with self._lock:
+            if self.model is None or not self.model.model.model_is_loaded:
+                self.load_model()
+
+            start = time.perf_counter()
+            segments, info = self.model.transcribe(
+                audio_path,
+                beam_size=5,
+                condition_on_previous_text=False,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+            )
+
+            text = " ".join(segment.text.strip() for segment in segments)
+            elapsed = time.perf_counter() - start
+            log.info("Transcription took %.1fs (%d chars)", elapsed, len(text))
+
+            metadata = {
+                "language": info.language,
+                "language_probability": round(info.language_probability, 4),
+                "audio_duration": round(info.duration, 2),
+                "processing_time": round(elapsed, 2),
+            }
+            return text, metadata

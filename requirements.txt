@@ -7,6 +7,9 @@ keyboard>=0.13.5
 pystray>=0.19.5
 pillow>=10.2.0
 PyQt5>=5.15.11
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.18
 
 # Windows CUDA support (GPU acceleration)
 nvidia-cudnn-cu12; sys_platform == "win32"

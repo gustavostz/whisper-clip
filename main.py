@@ -76,6 +76,29 @@ def setup_logging(enabled):
     logger.info("Logging initialized — log file: %s", log_file)
 
 
+def _start_server(whisper_client, port, api_key, llm_context_prefix_default):
+    """Start the FastAPI server in a daemon thread."""
+    import uvicorn
+    from server import create_app
+
+    fastapi_app = create_app(whisper_client, api_key, llm_context_prefix_default)
+
+    uvi_config = uvicorn.Config(
+        app=fastapi_app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+    )
+    server = uvicorn.Server(uvi_config)
+    # Signals must be handled on the main thread (Tkinter), not here
+    server.install_signal_handlers = lambda: None
+
+    thread = threading.Thread(target=server.run, name="api-server", daemon=True)
+    thread.start()
+
+    logging.getLogger("whisperclip").info("API server started on 0.0.0.0:%d", port)
+
+
 def main():
     # Load configurations from the config file
     with open('config.json', 'r') as config_file:
@@ -89,15 +112,35 @@ def main():
         'llm_context_prefix': True,
         'compute_type': 'int8',
         'debug_logs': False,
+        'server_enabled': False,
+        'server_port': 8787,
+        'server_api_key': '',
     }
     config = {**default_config, **config}
 
     setup_logging(config.pop('debug_logs'))
 
+    # Extract server config (pop so they don't get passed to AudioRecorder)
+    server_enabled = config.pop('server_enabled')
+    server_port = config.pop('server_port')
+    server_api_key = config.pop('server_api_key')
+
     from audio_recorder import AudioRecorder
 
     root = tk.Tk()
     app = AudioRecorder(root, **config)
+
+    # Start API server in daemon thread if enabled
+    if server_enabled:
+        if not server_api_key:
+            log = logging.getLogger("whisperclip")
+            log.error(
+                "server_enabled=true but server_api_key is empty. "
+                "Generate a key with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+            )
+        else:
+            _start_server(app.transcriber, server_port, server_api_key, config.get('llm_context_prefix', True))
+
     root.mainloop()
 
 
