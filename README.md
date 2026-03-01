@@ -111,7 +111,7 @@ WhisperClip includes a built-in API server that lets you transcribe audio from y
 
 ### Server Setup
 
-1. Generate a secure API key:
+1. Generate an API key — this can be any password or string you choose. For a random secure key, you can run:
    ```
    python -c "import secrets; print(secrets.token_urlsafe(32))"
    ```

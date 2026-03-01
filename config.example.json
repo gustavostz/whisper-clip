@@ -7,5 +7,5 @@
     "debug_logs": false,
     "server_enabled": false,
     "server_port": 8787,
-    "server_api_key": ""
+    "server_api_key": "YOUR_API_KEY_HERE"
 }

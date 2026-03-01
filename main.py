@@ -116,6 +116,19 @@ def _start_server(whisper_client, port, api_key, llm_context_prefix_default):
 
 def main():
     # Load configurations from the config file
+    if not os.path.exists('config.json'):
+        print(
+            "ERROR: config.json not found.\n"
+            "\n"
+            "To get started:\n"
+            "  1. Copy the example config:  cp config.example.json config.json\n"
+            "  2. Edit config.json with your settings\n"
+            "\n"
+            "See the README for full configuration details:\n"
+            "  https://github.com/gustavostz/whisper-clip#configuration"
+        )
+        sys.exit(1)
+
     with open('config.json', 'r') as config_file:
         config = json.load(config_file)
 
