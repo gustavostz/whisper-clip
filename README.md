@@ -98,6 +98,7 @@ cp config.example.json config.json
 |---------|---------|-------------|
 | `model_name` | `"turbo"` | Whisper model to use (see table above) |
 | `compute_type` | `"int8"` | Quantization type (`int8`, `float16`, `int8_float16`) |
+| `hotwords` | `""` | Space-separated words to bias transcription toward (e.g. `"Claude"` so "cloud code" becomes "Claude Code") |
 | `shortcut` | `"alt+shift+r"` | Global hotkey for toggling recording |
 | `notify_clipboard_saving` | `true` | Play a sound when transcription is copied to clipboard |
 | `llm_context_prefix` | `true` | Prepend a note to transcriptions explaining they were generated via speech-to-text |

@@ -21,7 +21,7 @@ log = logging.getLogger("whisperclip")
 
 
 class AudioRecorder:
-    def __init__(self, master, model_name="turbo", shortcut="alt+shift+r", notify_clipboard_saving=True, llm_context_prefix=True, compute_type="int8"):
+    def __init__(self, master, model_name="turbo", shortcut="alt+shift+r", notify_clipboard_saving=True, llm_context_prefix=True, compute_type="int8", hotwords=""):
         self.system_platform = platform.system()
         self.output_folder = "output"
         self.master = master
@@ -32,7 +32,7 @@ class AudioRecorder:
         self.is_recording = False
         self.recordings = []
         self.transcription_queue = queue.Queue()
-        self.transcriber = WhisperClient(model_name=model_name, compute_type=compute_type)
+        self.transcriber = WhisperClient(model_name=model_name, compute_type=compute_type, hotwords=hotwords)
         self.keep_transcribing = True
         self.shortcut = shortcut
         self.notify_clipboard_saving = notify_clipboard_saving

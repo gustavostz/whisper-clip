@@ -139,6 +139,7 @@ def main():
         'notify_clipboard_saving': True,
         'llm_context_prefix': True,
         'compute_type': 'int8',
+        'hotwords': '',
         'debug_logs': False,
         'server_enabled': False,
         'server_port': 8787,

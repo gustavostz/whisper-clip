@@ -6,9 +6,10 @@ log = logging.getLogger("whisperclip")
 
 
 class WhisperClient:
-    def __init__(self, model_name="turbo", compute_type="int8"):
+    def __init__(self, model_name="turbo", compute_type="int8", hotwords=None):
         self.model_name = model_name
         self.compute_type = compute_type
+        self.hotwords = hotwords or None
         self.model = None
         self._lock = threading.RLock()
 
@@ -66,6 +67,7 @@ class WhisperClient:
                 condition_on_previous_text=False,
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
+                hotwords=self.hotwords,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
@@ -86,6 +88,7 @@ class WhisperClient:
                 condition_on_previous_text=False,
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
+                hotwords=self.hotwords,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
