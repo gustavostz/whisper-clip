@@ -281,6 +281,20 @@ class TestServerStartup:
         finally:
             sock.close()
 
+    def test_no_stdout_does_not_crash(self, caplog):
+        """Server should start even when sys.stdout is None (no console, e.g. pythonw)."""
+        from main import _start_server
+
+        client = WhisperClient(model_name="tiny", compute_type="int8")
+
+        with patch("sys.stdout", None):
+            with caplog.at_level(logging.ERROR, logger="whisperclip"):
+                # Should not raise ValueError from uvicorn's logging formatter
+                _start_server(client, 28787, "test-key", True)
+
+        # No error about formatter or isatty should appear
+        assert "unable to configure formatter" not in caplog.text.lower()
+
     def test_empty_api_key_logs_error(self, caplog):
         """main() should log error when server_enabled but api_key is empty."""
         # This path is in main() itself, not _start_server

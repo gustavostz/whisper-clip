@@ -101,6 +101,7 @@ def _start_server(whisper_client, port, api_key, llm_context_prefix_default):
             host="0.0.0.0",
             port=port,
             log_level="info",
+            log_config=None,  # Use our own logging; uvicorn's default crashes when sys.stdout is None (no console)
         )
         server = uvicorn.Server(uvi_config)
         # Signals must be handled on the main thread (Tkinter), not here
