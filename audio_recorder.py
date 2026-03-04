@@ -134,6 +134,7 @@ class AudioRecorder:
             log.error("Model pre-loading failed: %s", e, exc_info=True)
 
     def toggle_recording(self):
+        log.debug("toggle_recording triggered")
         # Run in a separate thread to avoid blocking the keyboard hook
         # (Windows unhooks low-level keyboard hooks that take too long)
         threading.Thread(target=self._toggle_recording, daemon=True).start()
@@ -281,7 +282,11 @@ class AudioRecorder:
 
     def setup_global_shortcut(self):
         # Use the shortcut passed during initialization
-        keyboard.add_hotkey(self.shortcut, self.toggle_recording)
+        try:
+            keyboard.add_hotkey(self.shortcut, self.toggle_recording)
+            log.debug("Global hotkey registered: %s", self.shortcut)
+        except Exception as e:
+            log.error("Failed to register global hotkey '%s': %s", self.shortcut, e, exc_info=True)
 
     def setup_system_tray(self):
         # Load the icon image from a file
