@@ -67,14 +67,19 @@ class AudioVisualizer(QWidget):
         self.center_at_bottom()
         
     def center_at_bottom(self):
-        """Position window at bottom center of primary screen"""
-        screen = QApplication.primaryScreen()
+        """Position window at bottom center of the screen where the cursor is"""
+        from PyQt5.QtGui import QCursor
+
+        cursor_pos = QCursor.pos()
+        screen = QApplication.screenAt(cursor_pos)
+        if screen is None:
+            screen = QApplication.primaryScreen()
         screen_geometry = screen.geometry()
-        
-        # Calculate position
-        x = (screen_geometry.width() - self.width()) // 2
-        y = screen_geometry.height() - self.height() - 50  # 50px from bottom
-        
+
+        # Calculate position using screen geometry (includes offset for multi-monitor)
+        x = screen_geometry.x() + (screen_geometry.width() - self.width()) // 2
+        y = screen_geometry.y() + screen_geometry.height() - self.height() - 50  # 50px from bottom
+
         self.move(x, y)
         
     def update_audio_level(self, level):
@@ -96,7 +101,8 @@ class AudioVisualizer(QWidget):
         self.is_recording = False
         self.target_opacity = 1.0
         self.opacity = 0.0  # Start from transparent
-        
+
+        self.center_at_bottom()  # Reposition to current active screen
         self.show()
         self.raise_()  # Bring to front
         self.activateWindow()  # Make sure it's active
