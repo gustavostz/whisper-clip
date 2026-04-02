@@ -11,7 +11,6 @@ import os
 import logging
 from datetime import datetime
 from whisper_client import WhisperClient
-import keyboard
 from pystray import Icon, MenuItem, Menu
 from PIL import Image
 import platform
@@ -139,8 +138,7 @@ class AudioRecorder:
 
     def toggle_recording(self):
         log.debug("toggle_recording triggered")
-        # Run in a separate thread to avoid blocking the keyboard hook
-        # (Windows unhooks low-level keyboard hooks that take too long)
+        # Run in a separate thread to avoid blocking the hotkey listener or GUI
         threading.Thread(target=self._toggle_recording, daemon=True).start()
 
     def _toggle_recording(self):
@@ -284,11 +282,110 @@ class AudioRecorder:
             except queue.Full:
                 pass  # Skip if queue is full
 
+    def _parse_shortcut(self, shortcut):
+        """Parse a shortcut string like 'alt+shift+r' into (modifiers, vk_code) for RegisterHotKey."""
+        import ctypes
+
+        MOD_ALT = 0x0001
+        MOD_CONTROL = 0x0002
+        MOD_SHIFT = 0x0004
+        MOD_WIN = 0x0008
+
+        modifier_map = {
+            'alt': MOD_ALT,
+            'ctrl': MOD_CONTROL, 'control': MOD_CONTROL,
+            'shift': MOD_SHIFT,
+            'win': MOD_WIN, 'windows': MOD_WIN, 'super': MOD_WIN,
+        }
+
+        parts = [p.strip().lower() for p in shortcut.split('+')]
+        modifiers = 0
+        key = None
+
+        for part in parts:
+            if part in modifier_map:
+                modifiers |= modifier_map[part]
+            else:
+                key = part
+
+        if key is None:
+            raise ValueError(f"No key found in shortcut '{shortcut}'")
+
+        # Convert key to virtual key code
+        if len(key) == 1:
+            # Single character — use VkKeyScanW
+            vk = ctypes.windll.user32.VkKeyScanW(ord(key)) & 0xFF
+        else:
+            # Named keys
+            named_keys = {
+                'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73,
+                'f5': 0x74, 'f6': 0x75, 'f7': 0x76, 'f8': 0x77,
+                'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
+                'space': 0x20, 'enter': 0x0D, 'return': 0x0D,
+                'tab': 0x09, 'escape': 0x1B, 'esc': 0x1B,
+                'backspace': 0x08, 'delete': 0x2E, 'insert': 0x2D,
+                'home': 0x24, 'end': 0x23,
+                'pageup': 0x21, 'page_up': 0x21,
+                'pagedown': 0x22, 'page_down': 0x22,
+                'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
+                'printscreen': 0x2C, 'print_screen': 0x2C,
+                'pause': 0x13, 'capslock': 0x14, 'numlock': 0x90,
+            }
+            vk = named_keys.get(key)
+            if vk is None:
+                raise ValueError(f"Unknown key '{key}' in shortcut '{shortcut}'")
+
+        return modifiers, vk
+
     def setup_global_shortcut(self):
-        # Use the shortcut passed during initialization
+        if self.system_platform == 'Windows':
+            self._setup_hotkey_win32()
+        else:
+            self._setup_hotkey_fallback()
+
+    def _setup_hotkey_win32(self):
+        """Register hotkey using Win32 RegisterHotKey — immune to the silent-unhook
+        problem that plagues low-level keyboard hooks (WH_KEYBOARD_LL)."""
+        import ctypes
+        from ctypes import wintypes
+
+        HOTKEY_ID = 1
+        WM_HOTKEY = 0x0312
+
         try:
+            modifiers, vk = self._parse_shortcut(self.shortcut)
+        except ValueError as e:
+            log.error("Cannot parse shortcut '%s': %s", self.shortcut, e)
+            self._setup_hotkey_fallback()
+            return
+
+        def hotkey_thread():
+            user32 = ctypes.windll.user32
+            if not user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
+                log.error("RegisterHotKey failed for '%s' (error %d). "
+                          "Another app may have claimed this shortcut.",
+                          self.shortcut, ctypes.GetLastError())
+                return
+            log.debug("Global hotkey registered via RegisterHotKey: %s", self.shortcut)
+
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
+                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                    self.toggle_recording()
+
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+            log.debug("Global hotkey unregistered")
+
+        t = threading.Thread(target=hotkey_thread, name="hotkey-listener", daemon=True)
+        t.start()
+        self._hotkey_thread = t
+
+    def _setup_hotkey_fallback(self):
+        """Fallback using the keyboard library for non-Windows platforms."""
+        try:
+            import keyboard
             keyboard.add_hotkey(self.shortcut, self.toggle_recording)
-            log.debug("Global hotkey registered: %s", self.shortcut)
+            log.debug("Global hotkey registered (keyboard library): %s", self.shortcut)
         except Exception as e:
             log.error("Failed to register global hotkey '%s': %s", self.shortcut, e, exc_info=True)
 
