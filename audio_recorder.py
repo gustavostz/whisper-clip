@@ -92,6 +92,10 @@ class AudioRecorder:
                                       cursor="hand2")
         self.record_button.pack(expand=True)
 
+        shortcut_label = tk.Label(center_frame, text=self.shortcut, font=("Arial", 8),
+                                  fg="#999999", bg="white")
+        shortcut_label.pack(pady=(0, 5))
+
         # Bottom frame for checkbox
         bottom_frame = tk.Frame(main_frame, bg="white")
         bottom_frame.pack(fill=tk.X, pady=(0, 5))
