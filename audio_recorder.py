@@ -338,14 +338,15 @@ class AudioRecorder:
         return modifiers, vk
 
     def setup_global_shortcut(self):
+        self._hook_refresh_timer = None
         if self.system_platform == 'Windows':
             self._setup_hotkey_win32()
         else:
-            self._setup_hotkey_fallback()
+            self._setup_hotkey_keyboard_lib()
 
     def _setup_hotkey_win32(self):
-        """Register hotkey using Win32 RegisterHotKey — immune to the silent-unhook
-        problem that plagues low-level keyboard hooks (WH_KEYBOARD_LL)."""
+        """Try RegisterHotKey first (most reliable). If another app already claimed
+        the shortcut, fall back to keyboard library with periodic hook refresh."""
         import ctypes
         from ctypes import wintypes
 
@@ -356,38 +357,69 @@ class AudioRecorder:
             modifiers, vk = self._parse_shortcut(self.shortcut)
         except ValueError as e:
             log.error("Cannot parse shortcut '%s': %s", self.shortcut, e)
-            self._setup_hotkey_fallback()
+            self._setup_hotkey_keyboard_lib()
             return
+
+        registered = threading.Event()
+        self._hotkey_registered_ok = False
 
         def hotkey_thread():
             user32 = ctypes.windll.user32
-            if not user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
-                log.error("RegisterHotKey failed for '%s' (error %d). "
-                          "Another app may have claimed this shortcut.",
-                          self.shortcut, ctypes.GetLastError())
-                return
-            log.debug("Global hotkey registered via RegisterHotKey: %s", self.shortcut)
+            if user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
+                self._hotkey_registered_ok = True
+                registered.set()
+                log.debug("Global hotkey registered via RegisterHotKey: %s", self.shortcut)
 
-            msg = wintypes.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
-                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                    self.toggle_recording()
+                msg = wintypes.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
+                    if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                        self.toggle_recording()
 
-            user32.UnregisterHotKey(None, HOTKEY_ID)
-            log.debug("Global hotkey unregistered")
+                user32.UnregisterHotKey(None, HOTKEY_ID)
+                log.debug("Global hotkey unregistered")
+            else:
+                registered.set()
+                log.warning("RegisterHotKey failed for '%s' (error %d) — "
+                            "another app has this shortcut. Falling back to keyboard library.",
+                            self.shortcut, ctypes.GetLastError())
 
         t = threading.Thread(target=hotkey_thread, name="hotkey-listener", daemon=True)
         t.start()
         self._hotkey_thread = t
 
-    def _setup_hotkey_fallback(self):
-        """Fallback using the keyboard library for non-Windows platforms."""
+        # Wait for the registration result (near-instant)
+        registered.wait(timeout=2.0)
+
+        if not self._hotkey_registered_ok:
+            self._setup_hotkey_keyboard_lib()
+
+    def _setup_hotkey_keyboard_lib(self):
+        """Use keyboard library with periodic hook refresh to prevent Windows
+        from silently removing the WH_KEYBOARD_LL hook."""
         try:
             import keyboard
+            self._kb = keyboard
             keyboard.add_hotkey(self.shortcut, self.toggle_recording)
             log.debug("Global hotkey registered (keyboard library): %s", self.shortcut)
+            self._schedule_hook_refresh()
         except Exception as e:
             log.error("Failed to register global hotkey '%s': %s", self.shortcut, e, exc_info=True)
+
+    def _schedule_hook_refresh(self):
+        """Periodically tear down and re-register the keyboard hook so it
+        stays alive even if Windows silently removes it."""
+        def refresh():
+            try:
+                self._kb.unhook_all()
+                self._kb.add_hotkey(self.shortcut, self.toggle_recording)
+                log.debug("Keyboard hook refreshed")
+            except Exception as e:
+                log.error("Failed to refresh keyboard hook: %s", e)
+            self._schedule_hook_refresh()
+
+        self._hook_refresh_timer = threading.Timer(60.0, refresh)
+        self._hook_refresh_timer.daemon = True
+        self._hook_refresh_timer.start()
 
     def setup_system_tray(self):
         # Load the icon image from a file
@@ -410,6 +442,8 @@ class AudioRecorder:
 
     def exit_application(self):
         log.info("Application exiting")
+        if self._hook_refresh_timer is not None:
+            self._hook_refresh_timer.cancel()
         self.keep_transcribing = False
         self.transcription_thread.join()
         self.visualizer_manager.stop()
