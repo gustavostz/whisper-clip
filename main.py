@@ -175,4 +175,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required on Windows for multiprocessing-spawned subprocesses
+    # (e.g. the hotkey fallback listener and the audio visualizer).
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
