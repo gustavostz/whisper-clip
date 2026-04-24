@@ -87,7 +87,8 @@ class AudioRecorder:
         center_frame = tk.Frame(main_frame, bg="white")
         center_frame.pack(expand=True, fill=tk.BOTH)
 
-        self.record_button = tk.Button(center_frame, text="\U0001f399", command=self.toggle_recording,
+        self.record_button = tk.Button(center_frame, text="\U0001f399",
+                                      command=self._toggle_recording_from_button,
                                       font=("Arial", 24), bg="white", relief=tk.RAISED,
                                       cursor="hand2")
         self.record_button.pack(expand=True)
@@ -140,6 +141,19 @@ class AudioRecorder:
     def toggle_recording(self):
         log.debug("toggle_recording triggered")
         # Run in a separate thread to avoid blocking the hotkey listener or GUI
+        threading.Thread(target=self._toggle_recording, daemon=True).start()
+
+    def _toggle_recording_from_button(self):
+        """Called when the UI record button is clicked. If the hotkey
+        listener is in fallback mode, the click is a strong signal that
+        the hotkey was dead — we pass that hint to the listener so it can
+        force-refresh its hook."""
+        log.debug("toggle_recording triggered (from UI button click)")
+        if self.hotkey_listener is not None:
+            try:
+                self.hotkey_listener.notice_button_click()
+            except Exception as e:
+                log.error("notice_button_click failed: %s", e, exc_info=True)
         threading.Thread(target=self._toggle_recording, daemon=True).start()
 
     def _toggle_recording(self):
