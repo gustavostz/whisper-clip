@@ -25,7 +25,7 @@ WhisperClip simplifies your life by automatically transcribing audio recordings 
 
 ## Features
 
-- Record audio with a simple click or global hotkey (`Alt+Shift+R`).
+- Record audio with a simple click or global hotkey (`Alt+Shift+S`).
 - Fast, local transcription using OpenAI's Whisper model with GPU acceleration (CUDA).
 - Option to save transcriptions directly to the clipboard.
 - Transcribe existing audio files via the file picker.
@@ -99,7 +99,7 @@ cp config.example.json config.json
 | `model_name` | `"turbo"` | Whisper model to use (see table above) |
 | `compute_type` | `"int8"` | Quantization type (`int8`, `float16`, `int8_float16`) |
 | `hotwords` | `""` | Space-separated words to bias transcription toward (e.g. `"Claude"` so "cloud code" becomes "Claude Code") |
-| `shortcut` | `"alt+shift+r"` | Global hotkey for toggling recording |
+| `shortcut` | `"alt+shift+s"` | Global hotkey for toggling recording ("S for Speak". Avoid modifier+R combos: NVIDIA App holds Alt+R/Alt+Shift+R/Ctrl+Alt+R and AMD ReLive holds Ctrl+Shift+R, which silently breaks the hotkey) |
 | `notify_clipboard_saving` | `true` | Play a sound when transcription is copied to clipboard |
 | `llm_context_prefix` | `true` | Prepend a note to transcriptions explaining they were generated via speech-to-text |
 | `server_enabled` | `false` | Enable the remote transcription API server |

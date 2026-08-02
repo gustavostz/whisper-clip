@@ -116,9 +116,14 @@ def _start_server(whisper_client, port, api_key, llm_context_prefix_default):
 
 
 def main():
+    # Anchor the working directory to the script location. Startup methods
+    # like the HKCU Run key launch with an arbitrary cwd, and config.json /
+    # assets are opened with relative paths.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
     # Load configurations from the config file
     if not os.path.exists('config.json'):
-        print(
+        message = (
             "ERROR: config.json not found.\n"
             "\n"
             "To get started:\n"
@@ -128,6 +133,12 @@ def main():
             "See the README for full configuration details:\n"
             "  https://github.com/gustavostz/whisper-clip#configuration"
         )
+        print(message)
+        if sys.platform == "win32":
+            # Under pythonw there is no console — the print above goes
+            # nowhere and the app would just silently not appear.
+            from win_bootstrap import fatal_error_box
+            fatal_error_box("WhisperClip — missing config.json", message)
         sys.exit(1)
 
     with open('config.json', 'r') as config_file:
@@ -136,7 +147,7 @@ def main():
     # Set default values for missing keys (if you want to change it, you must change the config.json file, not here)
     default_config = {
         'model_name': 'turbo',
-        'shortcut': 'alt+shift+r',
+        'shortcut': 'alt+shift+s',
         'notify_clipboard_saving': True,
         'llm_context_prefix': True,
         'compute_type': 'int8',
@@ -149,6 +160,20 @@ def main():
     config = {**default_config, **config}
 
     setup_logging(config.pop('debug_logs'))
+
+    if sys.platform == "win32":
+        from win_bootstrap import (acquire_single_instance,
+                                   reap_orphaned_children,
+                                   setup_kill_children_with_parent)
+        log = logging.getLogger("whisperclip")
+        if not acquire_single_instance():
+            log.info("Another WhisperClip instance is already running — exiting")
+            sys.exit(0)
+        # Kill leftovers from hard-killed older instances BEFORE spawning
+        # our own children, then arm the job object so OUR children can
+        # never outlive us either.
+        reap_orphaned_children()
+        setup_kill_children_with_parent()
 
     # Extract server config (pop so they don't get passed to AudioRecorder)
     server_enabled = config.pop('server_enabled')

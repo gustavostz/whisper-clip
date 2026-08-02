@@ -1,6 +1,6 @@
 {
     "model_name": "turbo",
-    "shortcut": "alt+shift+r",
+    "shortcut": "alt+shift+s",
     "notify_clipboard_saving": true,
     "llm_context_prefix": true,
     "compute_type": "int8",

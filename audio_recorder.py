@@ -21,7 +21,7 @@ log = logging.getLogger("whisperclip")
 
 
 class AudioRecorder:
-    def __init__(self, master, model_name="turbo", shortcut="alt+shift+r", notify_clipboard_saving=True, llm_context_prefix=True, compute_type="int8", hotwords=""):
+    def __init__(self, master, model_name="turbo", shortcut="alt+shift+s", notify_clipboard_saving=True, llm_context_prefix=True, compute_type="int8", hotwords=""):
         self.system_platform = platform.system()
         self.output_folder = "output"
         self.master = master
@@ -37,6 +37,16 @@ class AudioRecorder:
         self.shortcut = shortcut
         self.notify_clipboard_saving = notify_clipboard_saving
         self._toggle_lock = threading.Lock()
+        self._recorded_samplerate = 44100
+
+        # Cross-thread UI marshaling: Tkinter must only be touched from the
+        # main thread. Worker/tray/hotkey threads enqueue callables here and
+        # a recurring after() pump runs them on the main loop.
+        self._ui_queue = queue.Queue()
+        self.master.after(50, self._drain_ui_queue)
+
+        # Lazy IVirtualDesktopManager helper (created on the main thread).
+        self._vdh_holder = [None]
 
         # Initialize visualizer manager
         self.visualizer_manager = VisualizerManager()
@@ -101,17 +111,28 @@ class AudioRecorder:
         bottom_frame = tk.Frame(main_frame, bg="white")
         bottom_frame.pack(fill=tk.X, pady=(0, 5))
 
+        # Plain-bool mirrors of the checkbox state: BooleanVar.get() is a Tcl
+        # call and must not run on worker threads (the transcription thread
+        # reads these). The command callbacks run on the main thread.
+        self._save_to_clipboard_flag = True
+        self._llm_prefix_flag = llm_context_prefix
+
         self.save_to_clipboard = tk.BooleanVar(value=True)
         self.clipboard_checkbox = tk.Checkbutton(bottom_frame, text="Save to Clipboard",
-                                                variable=self.save_to_clipboard, bg="white")
+                                                variable=self.save_to_clipboard, bg="white",
+                                                command=self._sync_checkbox_flags)
         self.clipboard_checkbox.pack()
 
         self.llm_context_prefix = tk.BooleanVar(value=llm_context_prefix)
         self.llm_prefix_checkbox = tk.Checkbutton(bottom_frame, text="LLM Context Prefix",
-                                                  variable=self.llm_context_prefix, bg="white")
+                                                  variable=self.llm_context_prefix, bg="white",
+                                                  command=self._sync_checkbox_flags)
         self.llm_prefix_checkbox.pack()
 
-        self.transcription_thread = threading.Thread(target=self.process_transcriptions)
+        # Daemon: exit_application joins with a timeout; a busy transcription
+        # must not be able to keep a half-dead headless process alive forever.
+        self.transcription_thread = threading.Thread(target=self.process_transcriptions,
+                                                     daemon=True)
         self.transcription_thread.start()
 
         # Start audio level processing thread
@@ -128,6 +149,26 @@ class AudioRecorder:
 
         log.info("WhisperClip started (model=%s, compute_type=%s, shortcut=%s)",
                  model_name, compute_type, shortcut)
+
+    def _ui(self, fn):
+        """Schedule a callable to run on the Tk main thread."""
+        self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:
+                log.error("UI callback failed: %s", e, exc_info=True)
+        self.master.after(50, self._drain_ui_queue)
+
+    def _sync_checkbox_flags(self):
+        self._save_to_clipboard_flag = self.save_to_clipboard.get()
+        self._llm_prefix_flag = self.llm_context_prefix.get()
 
     def _preload_model(self):
         """Pre-load model in background thread to reduce latency after recording stops."""
@@ -171,7 +212,7 @@ class AudioRecorder:
     def start_recording(self):
         log.info("Recording started")
         self.is_recording = True
-        self.record_button.config(bg="red")
+        self._ui(lambda: self.record_button.config(bg="red"))
 
         # Show visualizer in loading state immediately
         self.visualizer_manager.start_loading()
@@ -182,14 +223,19 @@ class AudioRecorder:
         threading.Thread(target=self._preload_model, daemon=True).start()
 
         # Start recording immediately
-        self.record_thread = threading.Thread(target=self.record_audio)
+        self.record_thread = threading.Thread(target=self.record_audio, daemon=True)
         self.record_thread.start()
 
     def stop_recording(self):
         self.is_recording = False
-        self.record_button.config(bg="white")
-        sd.stop()
-        self.record_thread.join()
+        self._ui(lambda: self.record_button.config(bg="white"))
+        # Bounded join: a wedged PortAudio stream close (seen after suspend /
+        # default-device changes) must not hold the toggle lock forever —
+        # that would make every future hotkey press a silent no-op.
+        self.record_thread.join(timeout=5.0)
+        if self.record_thread.is_alive():
+            log.error("Record thread did not stop within 5s — continuing "
+                      "without it (audio stream may be wedged)")
         log.info("Recording stopped")
 
         # Stop recording in visualizer (it will transition to transcription state)
@@ -200,7 +246,7 @@ class AudioRecorder:
             audio_data = (audio_data * 32767).astype(np.int16)
             os.makedirs(self.output_folder, exist_ok=True)
             filename = f"{self.output_folder}/audio_{int(time.time())}.wav"
-            write(filename, 44100, audio_data)
+            write(filename, self._recorded_samplerate, audio_data)
             self.recordings = []
             log.info("Audio saved: %s", filename)
             self.transcription_queue.put(filename)
@@ -236,8 +282,8 @@ class AudioRecorder:
                     # Show success animation first
                     self.visualizer_manager.stop_transcription()
 
-                    if self.save_to_clipboard.get():
-                        if self.llm_context_prefix.get():
+                    if self._save_to_clipboard_flag:
+                        if self._llm_prefix_flag:
                             transcription = "[Transcribed via speech-to-text (Whisper). Some words may be inaccurate \u2014 please interpret based on context.]\n\n" + transcription
                         pyperclip.copy(transcription)
                         log.debug("Transcription copied to clipboard")
@@ -275,9 +321,19 @@ class AudioRecorder:
         # Transition visualizer from loading to recording state
         self.visualizer_manager.start_recording()
 
-        with sd.InputStream(callback=self.audio_callback):
-            while self.is_recording:
-                sd.sleep(1000)
+        try:
+            with sd.InputStream(callback=self.audio_callback) as stream:
+                # The WAV must be written at the device's actual rate —
+                # hardcoding 44100 on a 48 kHz device pitch-shifts the audio
+                # and wrecks the transcription.
+                self._recorded_samplerate = int(stream.samplerate)
+                while self.is_recording:
+                    sd.sleep(100)
+        except Exception as e:
+            log.error("Audio input stream failed: %s", e, exc_info=True)
+            self.is_recording = False
+            self._ui(lambda: self.record_button.config(bg="white"))
+            self.visualizer_manager.stop_recording()
 
     def audio_callback(self, indata, frames, time, status):
         self.recordings.append(indata.copy())
@@ -322,12 +378,12 @@ class AudioRecorder:
         from the tray menu. Helps the user figure out which app is
         blocking RegisterHotKey when we're stuck in fallback mode."""
         if self.hotkey_listener is None:
-            messagebox.showinfo(
+            self._ui(lambda: messagebox.showinfo(
                 "Hotkey Diagnostic",
                 f"Platform: {self.system_platform}\n"
                 f"Shortcut: {self.shortcut}\n\n"
                 "Hotkey diagnostics are only available on Windows."
-            )
+            ))
             return
 
         report = self.hotkey_listener.diagnose()
@@ -345,7 +401,9 @@ class AudioRecorder:
         else:
             lines.append("  (none)")
 
-        messagebox.showinfo("Hotkey Diagnostic", "\n".join(lines))
+        # This runs on the tray thread; dialogs must be created on Tk's
+        # main thread or Tcl state can corrupt.
+        self._ui(lambda: messagebox.showinfo("Hotkey Diagnostic", "\n".join(lines)))
 
     def setup_system_tray(self):
         # Load the icon image from a file
@@ -364,21 +422,35 @@ class AudioRecorder:
         self.icon.run_detached()
 
     def show_window(self):
-        # Show the window again
-        self.master.deiconify()
+        # pystray callbacks run on the tray thread — marshal to Tk.
+        self._ui(self._show_window_on_main)
+
+    def _show_window_on_main(self):
+        """Show the window on the CURRENT virtual desktop instead of letting
+        Windows yank the user to whichever desktop the window lived on."""
+        if self.system_platform == 'Windows':
+            from virtual_desktop import bring_window_to_current_desktop
+            bring_window_to_current_desktop(self.master, self._vdh_holder)
+        else:
+            self.master.deiconify()
+            self.master.lift()
 
     def exit_application(self):
         log.info("Application exiting")
+        self.is_recording = False  # release a live record loop
         if self.hotkey_listener is not None:
             try:
                 self.hotkey_listener.stop()
             except Exception as e:
                 log.error("Error stopping hotkey listener: %s", e, exc_info=True)
         self.keep_transcribing = False
-        self.transcription_thread.join()
+        self.transcription_thread.join(timeout=10.0)
+        if self.transcription_thread.is_alive():
+            log.warning("Transcription thread still busy at exit — not waiting")
         self.visualizer_manager.stop()
         self.icon.stop()
-        self.master.quit()
+        # quit() must run on the main thread; this is called from the tray.
+        self._ui(self.master.quit)
 
     def select_audio_file(self):
         """Open file dialog to select an audio file for transcription"""

@@ -1,62 +1,66 @@
 """Global hotkey listener with automatic Win32 + subprocess fallback.
 
 Windows global-hotkey reliability is a minefield for Python apps. We solve
-several stacked root causes:
+several stacked root causes (all observed in production):
 
 1. **`RegisterHotKey` conflicts (error 1409).** Another process on the user's
-   system (NVIDIA App, GeForce Experience, Xbox Game Bar, ShareX, AutoHotkey,
-   OBS, ...) may already own the shortcut system-wide.
+   system may already own the shortcut system-wide. On this machine the NVIDIA
+   App overlay registers Alt+Shift+R ("cycle performance overlay") at logon,
+   permanently blocking the reliable path. `diagnose()` detects this.
 
-2. **`WH_KEYBOARD_LL` hooks die silently under GIL pressure.** Windows 10+
-   hard-caps low-level keyboard callbacks at ~1000 ms and permanently removes
-   the hook if a callback misses the budget. Whisper model loading / CUDA
-   calls routinely stall the main-process GIL well past 1 s.
+2. **`WH_KEYBOARD_LL` hooks die silently.** Windows removes a low-level hook
+   without notification if its callback misses the LowLevelHooksTimeout
+   budget (clamped to 1000 ms since Win10 1709), and session transitions
+   (lock/unlock, sleep/resume) can detach hooks outright. There is NO API to
+   detect removal.
 
-3. **`WH_KEYBOARD_LL` hooks die silently on session events.** Lock screen
-   transitions, session switches, display changes, sleep/resume, UAC prompts
-   — any of these can silently detach a low-level hook with no API to detect
-   it. This is independent of GIL pressure — process isolation alone is NOT
-   enough. We observed it in production: a subprocess-isolated hook went
-   dead after ~6 hours while the subprocess kept heartbeating happily.
+3. **The `keyboard` library cannot reinstall its hook.** It calls
+   SetWindowsHookEx exactly once per process (lazy listener thread guarded by
+   a never-reset `listening` flag); `unhook_all()` only clears Python-side
+   handler dicts. Any "unhook_all + add_hotkey refresh" is a placebo at the
+   OS level. The only real recovery is a fresh process.
 
 Our strategy:
 
 - **Primary: `RegisterHotKey` in a dedicated thread.** Kernel-posted
-  `WM_HOTKEY` — no timeout, no silent removal, survives lock/unlock,
-  not restricted by UIPI. The bulletproof path when we can get it.
+  `WM_HOTKEY` — no timeout, no silent removal, survives lock/unlock.
+  A retry loop keeps attempting the upgrade every 15 s.
 
-- **Fallback: `keyboard` library in a SEPARATE subprocess, with periodic
-  hook reinstallation every 30 s.** Process isolation solves problem (2).
-  Periodic refresh solves problem (3). The subprocess also listens for
-  `FORCE_REFRESH` signals so the main process can tell it to reinstall
-  immediately on session unlock.
+- **Fallback: `keyboard` library in a SEPARATE subprocess with an
+  end-to-end liveness probe.** The subprocess injects a harmless synthetic
+  F24 keypress via SendInput and verifies its own hook observed it. If the
+  hook is dead, the subprocess exits with a distinct code and the parent
+  respawns it — a fresh process is the only way to get a fresh
+  SetWindowsHookEx. Probes are gated on recent *real* user activity and are
+  skipped while the session is locked, so they never keep the machine awake
+  or fight the lock screen.
 
-- **Subprocess heartbeat + main-process watchdog.** Subprocess emits
-  `HEARTBEAT` every 15 s. If the main doesn't hear from it for 60 s, it
-  kills and respawns — guards against anything truly zombied.
+- **Watchdog with suspend awareness.** Heartbeat staleness is only trusted
+  when the watchdog itself hasn't just slept (a big monotonic gap means the
+  whole machine was suspended — that's a probe trigger, not a subprocess
+  failure). Respawns are governed by a sliding-window rate limiter that
+  backs off but NEVER permanently gives up.
 
-- **Session-change listener in main.** Registers for
-  `WM_WTSSESSION_CHANGE` via a message-only window so we can signal
-  `FORCE_REFRESH` the instant Windows comes back from lock / resume / etc.
+- **Session-change listener.** On unlock we immediately request a probe, so
+  a hook killed by the lock transition is detected and respawned within
+  seconds — exactly when the user is about to dictate.
 
-- **Button-click hint.** If the user clicks the record button while we're
-  in fallback mode, we infer the hotkey was dead and force-refresh — a
-  zero-cost recovery signal.
-
-- **Automatic upgrade.** A retry loop keeps attempting `RegisterHotKey`
-  every 15 s so we climb back to the reliable primary path the moment
-  the conflicting app exits.
+- **Process hygiene.** The subprocess watches its parent and self-exits if
+  the parent dies, so hard kills can't leave orphan hooks behind.
 
 - **Diagnostics.** Every transition is logged. `diagnose()` returns an
-  actionable report for the tray-menu "Diagnose Hotkey" entry.
+  actionable report and names the conflicting NVIDIA binding when it can
+  prove it from the NVIDIA overlay's own log.
 """
 import ctypes
 import logging
 import multiprocessing
 import os
 import platform
+import re
 import threading
 import time
+from collections import deque
 from ctypes import wintypes
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -68,7 +72,7 @@ log = logging.getLogger("whisperclip.hotkey")
 class HotkeyMode(str, Enum):
     WIN32 = "win32"              # RegisterHotKey — bulletproof
     FALLBACK = "fallback"        # keyboard library in subprocess — best effort
-    UNAVAILABLE = "unavailable"  # nothing is listening
+    UNAVAILABLE = "unavailable"  # nothing is listening (transient; auto-recovers)
 
 
 # --- Win32 constants ----------------------------------------------
@@ -112,6 +116,9 @@ _WIN_ERROR_NAMES = {
     1418: "ERROR_HOTKEY_NOT_REGISTERED",
 }
 
+# Subprocess exit codes with meaning to the parent.
+EXIT_HOOK_DEAD = 42   # liveness probe failed — hook silently removed by the OS
+
 
 def _win_error_name(code: int) -> str:
     return _WIN_ERROR_NAMES.get(code, f"UNKNOWN({code})")
@@ -142,35 +149,166 @@ def parse_shortcut(shortcut: str) -> tuple[int, int]:
     return modifiers, vk
 
 
+# --- Process responsiveness (priority / power throttling) ---------
+
+def ensure_process_responsiveness(logger=None):
+    """Raise this process out of below-normal priority and opt out of
+    Windows 11 power throttling (EcoQoS) + timer-resolution coalescing.
+
+    Task Scheduler launches tasks at BELOW_NORMAL priority when the task XML
+    has no <Priority> element, and hidden background processes are EcoQoS
+    candidates — both make WH_KEYBOARD_LL callbacks likelier to miss the
+    1000 ms deadline that gets hooks silently removed. Best-effort; failures
+    are logged and ignored.
+    """
+    logger = logger or log
+    if platform.system() != "Windows":
+        return
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        # Without explicit signatures ctypes truncates HANDLEs to 32 bits —
+        # GetCurrentProcess()'s pseudo-handle (-1) then becomes an invalid
+        # handle on x64 (error 6).
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+        kernel32.GetPriorityClass.restype = wintypes.DWORD
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+        kernel32.SetProcessInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+
+        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+        IDLE_PRIORITY_CLASS = 0x40
+        NORMAL_PRIORITY_CLASS = 0x20
+
+        current = kernel32.GetPriorityClass(kernel32.GetCurrentProcess())
+        if current in (BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS):
+            if kernel32.SetPriorityClass(kernel32.GetCurrentProcess(),
+                                         NORMAL_PRIORITY_CLASS):
+                logger.info("Raised process priority class 0x%x -> NORMAL", current)
+            else:
+                logger.warning("SetPriorityClass failed (error %d)",
+                               ctypes.get_last_error())
+
+        # PROCESS_POWER_THROTTLING_STATE: opt out of EcoQoS and timer coalescing.
+        class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG),
+                        ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+        ProcessPowerThrottling = 4
+
+        state = PROCESS_POWER_THROTTLING_STATE(
+            Version=1,
+            ControlMask=(PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                         | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION),
+            StateMask=0,  # 0 = force-disable throttling for the masked controls
+        )
+        ok = kernel32.SetProcessInformation(
+            kernel32.GetCurrentProcess(), ProcessPowerThrottling,
+            ctypes.byref(state), ctypes.sizeof(state),
+        )
+        if not ok:
+            logger.debug("SetProcessInformation(PowerThrottling) failed (error %d)",
+                         ctypes.get_last_error())
+    except Exception as e:
+        logger.warning("ensure_process_responsiveness failed: %s", e)
+
+
+# --- Synthetic input (probe) plumbing -----------------------------
+
+_VK_F24 = 0x87  # phantom key: no physical key, no app binds it — safe to inject
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUTunion(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTunion)]
+
+
+def _send_probe_key(user32) -> bool:
+    """Inject a synthetic F24 press+release. Returns True if accepted."""
+    KEYEVENTF_KEYUP = 0x0002
+    MAPVK_VK_TO_VSC = 0
+    # Fill in the real scan code — the keyboard library keys its matching
+    # off scan codes, and hooks downstream see a more realistic event.
+    scan = user32.MapVirtualKeyW(_VK_F24, MAPVK_VK_TO_VSC)
+    ok = True
+    for flags in (0, KEYEVENTF_KEYUP):
+        inp = _INPUT()
+        inp.type = 1  # INPUT_KEYBOARD
+        inp.u.ki = _KEYBDINPUT(_VK_F24, scan, flags, 0, 0)
+        if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) != 1:
+            ok = False
+    return ok
+
+
+def _session_input_available(user32) -> bool:
+    """True when the interactive desktop receives our input (not locked /
+    secure desktop). OpenInputDesktop fails while the session is locked."""
+    DESKTOP_READOBJECTS = 0x0001
+    hdesk = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+    if hdesk:
+        user32.CloseDesktop(hdesk)
+        return True
+    return False
+
+
 # --- Subprocess worker (fallback path) ----------------------------
 
-# How often the subprocess reinstalls its WH_KEYBOARD_LL hook proactively.
-# Windows can silently remove the hook on session events; periodic reinstall
-# is the canonical workaround used by AutoHotkey and similar tools.
-_SUBPROCESS_REFRESH_INTERVAL = 30.0
-
-# How often the subprocess sends a heartbeat to the main process.
+# Send a heartbeat to the parent this often.
 _SUBPROCESS_HEARTBEAT_INTERVAL = 15.0
+
+# Probe the hook end-to-end this often — but only when the user has been
+# genuinely active recently (see _recent_real_activity), so probes never
+# keep an idle machine awake.
+_PROBE_INTERVAL = 45.0
+
+# How long after a probe injection we wait for our own hook to see it.
+_PROBE_TIMEOUT = 1.5
+
+# Real user activity within this window enables periodic probing.
+_ACTIVITY_WINDOW = 90.0
 
 
 def _subprocess_worker(shortcut: str, trigger_queue, signal_queue,
-                       shutdown_flag, log_file_path: str):
+                       shutdown_flag, log_file_path: str, parent_pid: int):
     """Runs in a dedicated Python process. Owns a WH_KEYBOARD_LL hook via
     the `keyboard` library and emits events back to the parent.
 
     Events emitted to `trigger_queue` (parent consumes):
-        "TRIGGER"                        — hotkey pressed
-        ("HEARTBEAT", presses, refreshes) — liveness beacon
+        "TRIGGER"                                   — hotkey pressed
+        ("HEARTBEAT", presses, probes_sent, probes_ok) — liveness beacon
 
     Signals received on `signal_queue` (parent produces):
-        "FORCE_REFRESH" — reinstall the hook immediately
-                          (sent after Windows unlock, etc.)
-        "__READER_STOP__" — ignored here; used by parent's reader loop
+        "PROBE_NOW" — verify the hook end-to-end immediately
+                      (sent after Windows unlock, resume, button-click hint)
 
-    Why refresh the hook even though we're isolated from GIL pressure?
-    Because `WH_KEYBOARD_LL` silently dies on events the process can't
-    see (session transitions, display changes, some driver activity).
-    Reinstalling every 30 s catches that within one refresh cycle.
+    Recovery contract: if the end-to-end probe shows the OS hook is dead,
+    we exit with EXIT_HOOK_DEAD. Re-adding hotkeys in-process CANNOT revive
+    a removed hook (the keyboard library calls SetWindowsHookEx exactly once
+    per process), so a fresh process is the only real fix — the parent
+    respawns us.
+
+    We also watch the parent process and self-exit when it dies, so hard
+    kills (Task Scheduler, crashes) can never leave an orphan hook behind.
     """
     import logging as _logging
     import queue as _queue
@@ -191,9 +329,53 @@ def _subprocess_worker(shortcut: str, trigger_queue, signal_queue,
         pass  # Logging is best-effort; the hotkey must still work
 
     logger.info("=" * 60)
-    logger.info("Fallback hotkey subprocess starting, shortcut=%r", shortcut)
+    logger.info("Fallback hotkey subprocess starting, shortcut=%r parent=%d",
+                shortcut, parent_pid)
     logger.info("Python: %s  Platform: %s",
                 os.sys.version.split()[0], platform.platform())
+
+    ensure_process_responsiveness(logger)
+
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # --- Parent-death watch: no more orphan hooks -----------------
+    def _parent_watch():
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid)
+        if handle:
+            kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)  # INFINITE
+        else:
+            # Can't open the parent — poll for its existence instead.
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            while True:
+                h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                         False, parent_pid)
+                if not h:
+                    break
+                code = wintypes.DWORD()
+                alive = (kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                         and code.value == 259)  # STILL_ACTIVE
+                kernel32.CloseHandle(h)
+                if not alive:
+                    break
+                time.sleep(5.0)
+        logger.warning("Parent process %d died — exiting to avoid orphan hook",
+                       parent_pid)
+        os._exit(0)
+
+    threading.Thread(target=_parent_watch, daemon=True,
+                     name="parent-watch").start()
 
     try:
         import keyboard
@@ -202,7 +384,9 @@ def _subprocess_worker(shortcut: str, trigger_queue, signal_queue,
         return
 
     press_count = 0
-    refresh_count = 0
+    probes_sent = 0
+    probes_ok = 0
+    probe_seen = threading.Event()
 
     def on_trigger():
         nonlocal press_count
@@ -213,39 +397,87 @@ def _subprocess_worker(shortcut: str, trigger_queue, signal_queue,
         except Exception as e:
             logger.error("Queue put failed: %s", e)
 
-    def install_hook(reason: str) -> bool:
-        """(Re)install the keyboard hook. Returns True on success."""
-        nonlocal refresh_count
+    # Global observer: powers the liveness probe. Runs inside the same
+    # LL hook as the hotkey, so seeing the probe proves the hotkey works.
+    # PRIVACY: we only match the probe key — key contents are never
+    # inspected beyond that and never logged.
+    def _observer(event):
         try:
-            keyboard.unhook_all()
-        except Exception as e:
-            logger.warning("unhook_all before (re)install failed: %s", e)
-        try:
-            keyboard.add_hotkey(shortcut, on_trigger, suppress=False)
-            refresh_count += 1
-            logger.info("Hook installed (#%d, reason=%s) for %r",
-                        refresh_count, reason, shortcut)
-            return True
-        except Exception as e:
-            logger.error("add_hotkey failed (reason=%s): %s", reason, e,
-                         exc_info=True)
-            return False
+            if getattr(event, 'name', None) == 'f24':
+                probe_seen.set()
+        except Exception:
+            pass
 
-    if not install_hook("initial"):
-        logger.critical("Initial hook install failed — subprocess exiting")
+    try:
+        keyboard.hook(_observer)
+        keyboard.add_hotkey(shortcut, on_trigger, suppress=False)
+        logger.info("Hook installed for %r (+ probe observer)", shortcut)
+    except Exception as e:
+        logger.critical("Initial hook install failed: %s — subprocess exiting",
+                        e, exc_info=True)
         return
 
+    def do_probe(reason: str) -> Optional[bool]:
+        """End-to-end hook check. Returns True/False, or None if the
+        session can't receive input right now (locked) — not a failure."""
+        nonlocal probes_sent, probes_ok
+        if not _session_input_available(user32):
+            logger.debug("Probe (%s) skipped — session locked", reason)
+            return None
+        for attempt in (1, 2):
+            probe_seen.clear()
+            probes_sent += 1
+            if not _send_probe_key(user32):
+                logger.warning("Probe SendInput rejected (error %d)",
+                               ctypes.get_last_error())
+                return None  # can't inject — inconclusive, don't kill ourselves
+            if probe_seen.wait(timeout=_PROBE_TIMEOUT):
+                probes_ok += 1
+                logger.debug("Probe OK (%s, attempt %d)", reason, attempt)
+                return True
+            logger.warning("Probe NOT observed (%s, attempt %d/2)", reason, attempt)
+        return False
+
+    def probe_or_die(reason: str):
+        if do_probe(reason) is False:
+            logger.critical(
+                "Hook is DEAD (probe unseen twice, reason=%s) — exiting with "
+                "code %d so the parent respawns a fresh process (the only way "
+                "to get a new SetWindowsHookEx)", reason, EXIT_HOOK_DEAD,
+            )
+            os._exit(EXIT_HOOK_DEAD)
+
+    # Activity tracking: GetLastInputInfo advances on ANY input including our
+    # own injected probes, so input near a probe is attributed to the probe.
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    _last_input_tick = [0]
+    _last_probe_time = [0.0]
+    _last_real_activity = [time.monotonic()]  # assume active at startup
+
+    def _recent_real_activity() -> bool:
+        info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+        if user32.GetLastInputInfo(ctypes.byref(info)):
+            if info.dwTime != _last_input_tick[0]:
+                _last_input_tick[0] = info.dwTime
+                if time.monotonic() - _last_probe_time[0] > 2.0:
+                    _last_real_activity[0] = time.monotonic()
+        return (time.monotonic() - _last_real_activity[0]) < _ACTIVITY_WINDOW
+
     logger.info(
-        "Entering main loop (refresh every %.0fs, heartbeat every %.0fs)",
-        _SUBPROCESS_REFRESH_INTERVAL, _SUBPROCESS_HEARTBEAT_INTERVAL,
+        "Entering main loop (heartbeat every %.0fs, probe every %.0fs while active)",
+        _SUBPROCESS_HEARTBEAT_INTERVAL, _PROBE_INTERVAL,
     )
 
-    last_refresh = time.monotonic()
-    last_heartbeat = time.monotonic()
-    consecutive_refresh_failures = 0
+    # Validate the hook right after birth — catches born-dead installs.
+    time.sleep(1.0)
+    _last_probe_time[0] = time.monotonic()
+    probe_or_die("initial")
 
-    # Tight loop: poll the signal queue with a short timeout, then check
-    # timers. The short wait lets us react to FORCE_REFRESH within ~0.5 s.
+    last_probe = time.monotonic()
+    last_heartbeat = time.monotonic()
+
     while not shutdown_flag.is_set():
         try:
             signal = signal_queue.get(timeout=0.5)
@@ -257,49 +489,33 @@ def _subprocess_worker(shortcut: str, trigger_queue, signal_queue,
 
         now = time.monotonic()
 
-        if signal == "FORCE_REFRESH":
-            logger.info("FORCE_REFRESH received from main process")
-            if install_hook("force"):
-                last_refresh = now
-                consecutive_refresh_failures = 0
-            else:
-                consecutive_refresh_failures += 1
+        if signal == "PROBE_NOW":
+            logger.info("PROBE_NOW received from main process")
+            _last_probe_time[0] = now
+            probe_or_die("requested")
+            last_probe = now
 
-        # Periodic refresh
-        if now - last_refresh >= _SUBPROCESS_REFRESH_INTERVAL:
-            if install_hook("periodic"):
-                last_refresh = now
-                consecutive_refresh_failures = 0
-            else:
-                consecutive_refresh_failures += 1
-
-        # If refresh keeps failing, give up — parent watchdog will respawn us
-        if consecutive_refresh_failures >= 5:
-            logger.critical(
-                "Hook refresh failed %d times consecutively — exiting so "
-                "the parent watchdog respawns this subprocess",
-                consecutive_refresh_failures,
-            )
-            break
+        # Periodic probe — only while the user is genuinely active, so an
+        # idle machine is never kept awake by injected input.
+        if now - last_probe >= _PROBE_INTERVAL and _recent_real_activity():
+            _last_probe_time[0] = now
+            probe_or_die("periodic")
+            last_probe = now
 
         # Heartbeat
         if now - last_heartbeat >= _SUBPROCESS_HEARTBEAT_INTERVAL:
             try:
                 trigger_queue.put(
-                    ("HEARTBEAT", press_count, refresh_count),
+                    ("HEARTBEAT", press_count, probes_sent, probes_ok),
                     block=False,
                 )
             except Exception as e:
                 logger.warning("Heartbeat put failed: %s", e)
             last_heartbeat = now
-            logger.debug(
-                "Heartbeat sent (presses=%d, refreshes=%d)",
-                press_count, refresh_count,
-            )
 
     logger.info(
-        "Shutdown received — unhooking (presses=%d, refreshes=%d)",
-        press_count, refresh_count,
+        "Shutdown received — unhooking (presses=%d, probes=%d/%d ok)",
+        press_count, probes_ok, probes_sent,
     )
     try:
         keyboard.unhook_all()
@@ -307,6 +523,43 @@ def _subprocess_worker(shortcut: str, trigger_queue, signal_queue,
         logger.error("unhook_all on exit failed: %s", e)
 
     logger.info("Fallback hotkey subprocess exiting cleanly")
+
+
+# --- Respawn governor ---------------------------------------------
+
+class RespawnGovernor:
+    """Sliding-window rate limiter for subprocess respawns.
+
+    Allows up to `max_events` respawns per `window` seconds; beyond that,
+    `try_acquire` returns False until the window frees up. Unlike the old
+    lifetime counter this NEVER permanently gives up — a hotkey listener
+    that stops listening forever is the one unacceptable outcome.
+    """
+
+    def __init__(self, max_events: int = 6, window: float = 600.0):
+        self.max_events = max_events
+        self.window = window
+        self._events: deque = deque()
+        self._lock = threading.Lock()
+        self._blocked_logged = False
+
+    def try_acquire(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            while self._events and now - self._events[0] > self.window:
+                self._events.popleft()
+            if len(self._events) >= self.max_events:
+                if not self._blocked_logged:
+                    log.critical(
+                        "Respawn rate limit hit (%d in %.0fs) — backing off; "
+                        "will keep retrying as the window frees up",
+                        self.max_events, self.window,
+                    )
+                    self._blocked_logged = True
+                return False
+            self._events.append(now)
+            self._blocked_logged = False
+            return True
 
 
 # --- Main-process listener ----------------------------------------
@@ -324,9 +577,10 @@ class HotkeyListener:
     UI can show the user whether the reliable Win32 path is active or not.
     """
 
-    _UPGRADE_RETRY_INTERVAL = 15.0  # seconds between upgrade attempts
+    _UPGRADE_RETRY_INTERVAL = 15.0   # seconds between upgrade attempts
     _HEARTBEAT_STALE_THRESHOLD = 60.0  # seconds without heartbeat = zombie
     _WATCHDOG_POLL_INTERVAL = 10.0   # how often the watchdog checks
+    _BUTTON_HINT_DEBOUNCE = 10.0     # min seconds between button-click probes
 
     def __init__(self, shortcut: str, on_trigger: Callable[[], None],
                  log_dir: Optional[str] = None):
@@ -359,15 +613,16 @@ class HotkeyListener:
         self._subprocess_queue: Optional[Any] = None    # multiprocessing.Queue (child->parent)
         self._subprocess_signal_queue: Optional[Any] = None  # multiprocessing.Queue (parent->child)
         self._subprocess_reader: Optional[threading.Thread] = None
-        self._subprocess_respawn_attempts = 0
-        self._subprocess_respawn_limit = 3
+        self._respawn_governor = RespawnGovernor()
         self._last_subprocess_heartbeat: float = 0.0
         self._last_subprocess_press_count: int = 0
-        self._last_subprocess_refresh_count: int = 0
+        self._last_subprocess_probe_counts: tuple = (0, 0)
+        self._last_button_hint: float = 0.0
 
         # Upgrade loop + watchdog
         self._upgrade_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
+        self._last_watchdog_tick: float = 0.0
 
         # Session-change listener (Windows lock/unlock detection)
         self._session_thread: Optional[threading.Thread] = None
@@ -377,6 +632,8 @@ class HotkeyListener:
 
     def start(self):
         log.info("Starting hotkey listener for shortcut=%r", self.shortcut)
+
+        ensure_process_responsiveness()
 
         if self._try_start_win32():
             log.info("*** Hotkey ACTIVE via Win32 RegisterHotKey (reliable path) ***")
@@ -390,7 +647,7 @@ class HotkeyListener:
             self._start_subprocess()
             log.info(
                 "*** Hotkey ACTIVE via subprocess fallback "
-                "(with 30s periodic refresh + watchdog + session-unlock recovery) ***"
+                "(with end-to-end liveness probe + watchdog + session-unlock recovery) ***"
             )
 
         self._upgrade_thread = threading.Thread(
@@ -426,18 +683,22 @@ class HotkeyListener:
         """Hint from the UI layer that the user clicked the record button.
 
         If we're in fallback mode and the user clicks the button, odds are
-        high that they tried the hotkey first and it was dead. Force-refresh
-        the subprocess's hook immediately so the next hotkey press works.
-        Logged as WARNING so we can correlate "user-clicked-because-hotkey-
-        was-dead" events in the logs.
+        high that they tried the hotkey first and it was dead. Ask the
+        subprocess to verify its hook end-to-end right now; if the hook is
+        dead it self-exits and the watchdog respawns it within seconds.
         """
+        now = time.monotonic()
+        if now - self._last_button_hint < self._BUTTON_HINT_DEBOUNCE:
+            return
+        self._last_button_hint = now
+
         mode = self.get_mode()
         if mode == HotkeyMode.FALLBACK:
             log.warning(
                 "Button click while in FALLBACK mode — user may have tried "
-                "the hotkey first. Forcing subprocess hook refresh.",
+                "the hotkey first. Requesting hook liveness probe.",
             )
-            self._signal_subprocess("FORCE_REFRESH")
+            self._signal_subprocess("PROBE_NOW")
 
     def get_mode(self) -> HotkeyMode:
         with self._state_lock:
@@ -449,26 +710,22 @@ class HotkeyListener:
             return f"{self.shortcut} — reliable (Win32)"
         if mode == HotkeyMode.FALLBACK:
             return f"{self.shortcut} — fallback (another app owns this shortcut)"
-        return f"{self.shortcut} — NOT ACTIVE"
+        return f"{self.shortcut} — NOT ACTIVE (recovering)"
 
     def diagnose(self) -> dict:
         """Synchronously probe the Win32 hotkey state. Safe from any thread.
 
         Returns a dict with `shortcut`, `current_mode`, `win32_probe`
         (either 'success' or 'failed (error N: NAME)'), `win32_error_code`
-        (int or None), and a list of `suggestions` for the user.
-
-        The probe briefly registers then unregisters the hotkey with a
-        DIFFERENT id than our production listener, so the live listener
-        is not disturbed. HOWEVER: if our own Win32 listener is active,
-        Windows will return 1409 from this probe because we already own
-        it — that's the correct signal that Win32 mode is working.
+        (int or None), `conflict_owner` (str or None) and a list of
+        `suggestions` for the user.
         """
         report = {
             "shortcut": self.shortcut,
             "current_mode": self.get_mode().value,
             "win32_probe": None,
             "win32_error_code": None,
+            "conflict_owner": None,
             "suggestions": [],
         }
 
@@ -503,20 +760,30 @@ class HotkeyListener:
                 report["win32_error_code"] = err
                 report["win32_probe"] = f"failed (error {err}: {_win_error_name(err)})"
                 if err == 1409:
-                    report["suggestions"].extend([
-                        "Windows reports this shortcut is owned by another process "
-                        "(ERROR_HOTKEY_ALREADY_REGISTERED).",
-                        "Likely suspects: NVIDIA App / GeForce Experience, Xbox Game Bar, "
-                        "ShareX, OBS Studio, AutoHotkey scripts, Steam, Discord overlay.",
-                        "Disabling the UI toggle isn't always enough — some apps still "
-                        "register the hotkey as long as the process is running. Fully "
-                        "QUIT the suspect app from its tray icon and try again.",
-                        "Tool to identify the culprit: HotKeysList from NirSoft — "
-                        "enumerates every app holding a hotkey. "
-                        "https://www.nirsoft.net/utils/hotkeys_list.html",
+                    owner = detect_nvidia_binding(self._modifiers, self._vk)
+                    if owner:
+                        report["conflict_owner"] = owner
+                        report["suggestions"].extend([
+                            f"FOUND IT: the NVIDIA App overlay owns this shortcut "
+                            f"(binding: {owner}).",
+                            "Fix: open NVIDIA App -> Settings -> Shortcuts and "
+                            "clear or rebind that shortcut. WhisperClip will "
+                            "claim the reliable Win32 path within 15 seconds.",
+                        ])
+                    else:
+                        report["suggestions"].extend([
+                            "Windows reports this shortcut is owned by another process "
+                            "(ERROR_HOTKEY_ALREADY_REGISTERED).",
+                            "Likely suspects: NVIDIA App / GeForce Experience, Xbox Game Bar, "
+                            "ShareX, OBS Studio, AutoHotkey scripts, Steam, Discord overlay.",
+                            "Tool to identify the culprit: HotKeysList from NirSoft — "
+                            "https://www.nirsoft.net/utils/hotkeys_list.html",
+                        ])
+                    report["suggestions"].append(
                         "Quick workaround: change 'shortcut' in config.json to something "
-                        "uncontested, e.g. 'ctrl+shift+space', 'ctrl+alt+r', or 'f9'.",
-                    ])
+                        "uncontested, e.g. 'ctrl+shift+space' or 'f9'. (On this machine "
+                        "avoid all modifier+R combos — NVIDIA and AMD overlays hold them.)"
+                    )
                 else:
                     report["suggestions"].append(
                         f"Unexpected Win32 error {err}. Check the log file for details."
@@ -530,7 +797,7 @@ class HotkeyListener:
 
     def _try_start_win32(self) -> bool:
         """Spawn the Win32 listener thread. Returns True if it registered
-        successfully within 2 seconds, False otherwise."""
+        successfully within 3 seconds, False otherwise."""
         if self._shutdown.is_set():
             return False
         if self._win32_thread is not None and self._win32_thread.is_alive():
@@ -547,8 +814,8 @@ class HotkeyListener:
         )
         self._win32_thread.start()
 
-        if not self._win32_registered.wait(timeout=2.0):
-            log.warning("Win32 registration did not complete within 2s")
+        if not self._win32_registered.wait(timeout=3.0):
+            log.warning("Win32 registration did not complete within 3s")
             return False
 
         if self.get_mode() == HotkeyMode.WIN32:
@@ -668,7 +935,7 @@ class HotkeyListener:
             target=_subprocess_worker,
             args=(self.shortcut, self._subprocess_queue,
                   self._subprocess_signal_queue,
-                  self._subprocess_shutdown, log_file),
+                  self._subprocess_shutdown, log_file, os.getpid()),
             name="whisperclip-hotkey-fallback",
             daemon=True,
         )
@@ -687,7 +954,7 @@ class HotkeyListener:
         self._subprocess_reader.start()
 
     def _signal_subprocess(self, signal: str):
-        """Send a command to the running subprocess (e.g. FORCE_REFRESH)."""
+        """Send a command to the running subprocess (e.g. PROBE_NOW)."""
         q = self._subprocess_signal_queue
         if q is None:
             log.debug("Cannot signal %r — no subprocess signal queue", signal)
@@ -714,7 +981,7 @@ class HotkeyListener:
             except Exception:
                 pass
 
-        # Also drain/signal the child's signal queue so its own get() returns
+        # Also nudge the child's signal queue so its own get() returns
         # promptly (the child wakes on shutdown_flag anyway, this just avoids
         # a 500 ms wait in the last loop iteration).
         if self._subprocess_signal_queue is not None:
@@ -767,15 +1034,12 @@ class HotkeyListener:
                 item = q.get(timeout=0.5)
             except _queue.Empty:
                 if self._subprocess is not None and not self._subprocess.is_alive():
-                    log.error(
-                        "Fallback subprocess died unexpectedly (exit code %s)",
-                        self._subprocess.exitcode,
-                    )
                     self._handle_subprocess_death()
                     break
                 continue
             except (EOFError, OSError) as e:
                 log.warning("Subprocess queue closed: %s", e)
+                self._handle_subprocess_death()
                 break
 
             if self._shutdown.is_set():
@@ -788,24 +1052,40 @@ class HotkeyListener:
                 self._dispatch_trigger()
             elif isinstance(item, tuple) and item and item[0] == "HEARTBEAT":
                 self._last_subprocess_heartbeat = time.monotonic()
-                if len(item) >= 3:
-                    presses, refreshes = item[1], item[2]
-                    # Log at DEBUG only when counters advance, to keep noise
-                    # low but still make the refresh cadence visible.
+                if len(item) >= 4:
+                    presses, probes_sent, probes_ok = item[1], item[2], item[3]
                     if (presses != self._last_subprocess_press_count
-                            or refreshes != self._last_subprocess_refresh_count):
+                            or (probes_sent, probes_ok) != self._last_subprocess_probe_counts):
                         log.debug(
-                            "Subprocess heartbeat: presses=%d refreshes=%d",
-                            presses, refreshes,
+                            "Subprocess heartbeat: presses=%d probes=%d/%d ok",
+                            presses, probes_ok, probes_sent,
                         )
                     self._last_subprocess_press_count = presses
-                    self._last_subprocess_refresh_count = refreshes
+                    self._last_subprocess_probe_counts = (probes_sent, probes_ok)
             else:
                 log.warning("Unknown item from subprocess queue: %r", item)
 
     def _handle_subprocess_death(self):
-        """Try to respawn the subprocess if it crashed. Gives up after
-        a small number of attempts."""
+        """Respawn the subprocess after it died. Rate-limited but never
+        gives up permanently."""
+        proc = self._subprocess
+        exitcode = proc.exitcode if proc is not None else None
+
+        if exitcode == EXIT_HOOK_DEAD:
+            log.warning(
+                "Fallback subprocess exited: its OS hook was dead (probe "
+                "failed). Respawning for a fresh SetWindowsHookEx.",
+            )
+        else:
+            log.error("Fallback subprocess died unexpectedly (exit code %s)",
+                      exitcode)
+
+        # Tear down remaining plumbing for the dead process.
+        self._subprocess = None
+        self._subprocess_queue = None
+        self._subprocess_shutdown = None
+        self._subprocess_signal_queue = None
+
         with self._state_lock:
             if self._mode == HotkeyMode.FALLBACK:
                 self._mode = HotkeyMode.UNAVAILABLE
@@ -813,22 +1093,9 @@ class HotkeyListener:
         if self._shutdown.is_set():
             return
 
-        self._subprocess_respawn_attempts += 1
-        if self._subprocess_respawn_attempts > self._subprocess_respawn_limit:
-            log.critical(
-                "Fallback subprocess has died %d times — giving up. "
-                "Hotkey is NOT listening. Restart the app.",
-                self._subprocess_respawn_attempts,
-            )
+        if not self._respawn_governor.try_acquire():
+            # The watchdog re-attempts on its next poll; nothing else to do.
             return
-
-        log.warning(
-            "Respawning fallback subprocess (attempt %d/%d)",
-            self._subprocess_respawn_attempts, self._subprocess_respawn_limit,
-        )
-        self._subprocess = None
-        self._subprocess_queue = None
-        self._subprocess_shutdown = None
 
         # Wait with shutdown-aware sleep. While we sleep the upgrade loop
         # may take over the Win32 path or a stop() may arrive; re-check
@@ -843,21 +1110,47 @@ class HotkeyListener:
     # --- Watchdog ------------------------------------------------
 
     def _watchdog_loop(self):
-        """Kill + respawn the subprocess if its heartbeat goes stale.
+        """Recover from every known stuck state:
 
-        The subprocess may appear alive to the OS while its internal
-        `keyboard` library state (or the WH_KEYBOARD_LL hook itself) is
-        broken. We observed this in production: 16 hours of heartbeats,
-        but the hook only actually saw ~50% of real presses. If the
-        subprocess stops heartbeating at all, respawning is a clean way
-        out of any accumulated weirdness.
+        - FALLBACK with a stale heartbeat -> kill + respawn the subprocess
+          (rate-limited by the governor, never a permanent give-up).
+        - UNAVAILABLE with no live subprocess -> start one (the upgrade
+          loop separately keeps retrying the Win32 path).
+        - System resume: a large gap in our own poll cadence means the
+          machine was suspended — the subprocess's heartbeat is stale
+          because it was suspended too, NOT because it died. Reset the
+          baseline and probe the hook instead of burning a respawn.
         """
+        self._last_watchdog_tick = time.monotonic()
         while not self._shutdown.wait(timeout=self._WATCHDOG_POLL_INTERVAL):
-            if self.get_mode() != HotkeyMode.FALLBACK:
+            now = time.monotonic()
+            gap = now - self._last_watchdog_tick
+            self._last_watchdog_tick = now
+
+            if gap > 3 * self._WATCHDOG_POLL_INTERVAL:
+                log.info(
+                    "System resume detected (watchdog gap %.0fs) — resetting "
+                    "heartbeat baseline and probing the hook", gap,
+                )
+                self._last_subprocess_heartbeat = now
+                if self.get_mode() == HotkeyMode.FALLBACK:
+                    self._signal_subprocess("PROBE_NOW")
+                continue
+
+            mode = self.get_mode()
+
+            if mode == HotkeyMode.UNAVAILABLE:
+                alive = self._subprocess is not None and self._subprocess.is_alive()
+                if not alive and self._respawn_governor.try_acquire(now):
+                    log.warning("Mode is UNAVAILABLE — watchdog starting fallback subprocess")
+                    self._start_subprocess()
+                continue
+
+            if mode != HotkeyMode.FALLBACK:
                 continue
             if self._last_subprocess_heartbeat == 0:
                 continue  # subprocess hasn't sent its first heartbeat yet
-            age = time.monotonic() - self._last_subprocess_heartbeat
+            age = now - self._last_subprocess_heartbeat
             if age > self._HEARTBEAT_STALE_THRESHOLD:
                 log.error(
                     "Subprocess heartbeat stale (%.1fs > %.0fs) — "
@@ -869,31 +1162,18 @@ class HotkeyListener:
                 except Exception as e:
                     log.error("Error stopping stale subprocess: %s", e,
                               exc_info=True)
-                if not self._shutdown.is_set():
-                    self._subprocess_respawn_attempts += 1
-                    if self._subprocess_respawn_attempts <= self._subprocess_respawn_limit:
-                        log.info(
-                            "Watchdog respawning subprocess (attempt %d/%d)",
-                            self._subprocess_respawn_attempts,
-                            self._subprocess_respawn_limit,
-                        )
-                        self._start_subprocess()
-                    else:
-                        log.critical(
-                            "Watchdog respawn limit (%d) reached — giving up",
-                            self._subprocess_respawn_limit,
-                        )
+                if not self._shutdown.is_set() and self._respawn_governor.try_acquire():
+                    self._start_subprocess()
 
     # --- Session listener (Windows lock/unlock) -----------------
 
     def _session_listener_loop(self):
         """Create a message-only window and receive WM_WTSSESSION_CHANGE.
 
-        When Windows returns from lock, sleep, or fast user switch, it
-        reuses the old desktop but many low-level keyboard hooks get
-        silently detached during the transition. Catching the unlock
-        event lets us force-refresh the subprocess's hook immediately
-        instead of waiting up to 30 s for the periodic refresh.
+        When Windows returns from lock, sleep, or fast user switch, the
+        session transition may have silently detached the fallback's
+        low-level hook. Probing on unlock detects that within ~2 s —
+        exactly when the user is about to start dictating again.
         """
         WM_WTSSESSION_CHANGE = 0x02B1
         WTS_SESSION_UNLOCK = 0x8
@@ -933,10 +1213,12 @@ class HotkeyListener:
                 if wparam in (WTS_SESSION_UNLOCK, WTS_SESSION_LOGON,
                               WTS_CONSOLE_CONNECT):
                     log.warning(
-                        "Session event (wparam=0x%x) — forcing subprocess refresh",
+                        "Session event (wparam=0x%x) — requesting hook probe",
                         wparam,
                     )
-                    self._signal_subprocess("FORCE_REFRESH")
+                    if self.get_mode() == HotkeyMode.FALLBACK:
+                        self._signal_subprocess("PROBE_NOW")
+                    # UNAVAILABLE is handled by the watchdog within 10 s.
                 else:
                     log.debug("Session event (wparam=0x%x) — ignored", wparam)
                 return 0
@@ -1003,13 +1285,13 @@ class HotkeyListener:
             err = ctypes.get_last_error()
             log.warning(
                 "Session listener: WTSRegisterSessionNotification failed (error %d) — "
-                "falling back to periodic refresh only", err,
+                "relying on watchdog + activity-gated probes only", err,
             )
             user32.DestroyWindow(hwnd)
             self._session_hwnd = None
             return
 
-        log.info("Session listener registered — will force-refresh hook on unlock/logon/connect")
+        log.info("Session listener registered — will probe hook on unlock/logon/connect")
 
         msg = wintypes.MSG()
         try:
@@ -1058,7 +1340,7 @@ class HotkeyListener:
             mode = self.get_mode()
 
             if mode == HotkeyMode.WIN32:
-                # Sanity check: if the thread died while we were "WIN32",
+                # Sanity check 1: if the thread died while we were "WIN32",
                 # drop back to fallback.
                 if self._win32_thread is None or not self._win32_thread.is_alive():
                     log.warning("Win32 thread died while in WIN32 mode — "
@@ -1066,6 +1348,16 @@ class HotkeyListener:
                     with self._state_lock:
                         self._mode = HotkeyMode.UNAVAILABLE
                     self._start_subprocess()
+                    continue
+                # Sanity check 2: a late registration success may have left
+                # the subprocess running alongside — every press would fire
+                # twice (instant start+stop). Stop the duplicate.
+                if self._subprocess is not None and self._subprocess.is_alive():
+                    log.warning("Win32 active but fallback subprocess still "
+                                "running — stopping the duplicate")
+                    self._stop_subprocess()
+                    with self._state_lock:
+                        self._mode = HotkeyMode.WIN32
                 continue
 
             # Mode is FALLBACK or UNAVAILABLE — try to upgrade
@@ -1073,6 +1365,8 @@ class HotkeyListener:
             if self._try_start_win32():
                 log.info("*** Upgraded to Win32 hotkey path — stopping subprocess ***")
                 self._stop_subprocess()
+                with self._state_lock:
+                    self._mode = HotkeyMode.WIN32
 
     # --- Callback dispatch ----------------------------------------
 
@@ -1087,3 +1381,63 @@ class HotkeyListener:
             self.on_trigger()
         except Exception as e:
             log.error("on_trigger callback raised: %s", e, exc_info=True)
+
+
+# --- Conflict-owner detection -------------------------------------
+
+# NVIDIA overlay hotkey names -> human-readable descriptions.
+_NVIDIA_BINDING_NAMES = {
+    "PMOCOverlayCycle": "Cycle performance overlay stats",
+    "PMOCOverlay": "Toggle performance overlay",
+    "PMOCOverlayVisibility": "Show/hide performance overlay",
+    "OpenIGO": "Open overlay",
+    "DVRToggle": "Instant replay toggle",
+    "DVRSave": "Save instant replay",
+    "RecordToggle": "Record toggle",
+    "MicToggle": "Microphone toggle",
+    "FreestylePresentCycle": "Cycle game filters",
+}
+
+# Win32 hotkey modifier bits -> the VK codes NVIDIA's log lists.
+_MODIFIER_VKS = {_MOD_ALT: 18, _MOD_CONTROL: 17, _MOD_SHIFT: 16}
+
+
+def detect_nvidia_binding(modifiers: int, vk: int) -> Optional[str]:
+    """Best-effort check of the NVIDIA overlay's own log for a hotkey
+    binding matching ours. Returns a human-readable description or None.
+
+    NVIDIA Overlay's console.log contains lines like:
+        ... HotkeyService  Hot key mapping for PMOCOverlayCycle : [ 18, 16, 82 ]
+    where the list is VK codes (18=Alt, 16=Shift, 17=Ctrl, 82='R').
+    """
+    try:
+        path = os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "NVIDIA Corporation", "NVIDIA Overlay", "console.log",
+        )
+        if not os.path.isfile(path):
+            return None
+
+        ours = {mvk for mbit, mvk in _MODIFIER_VKS.items() if modifiers & mbit}
+        ours.add(vk)
+
+        pattern = re.compile(
+            r"Hot key mapping for (\w+)\s*:\s*\[\s*([\d,\s]+)\]"
+        )
+        best = None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                name = m.group(1)
+                vks = {int(x) for x in m.group(2).split(",") if x.strip()}
+                if vks == ours:
+                    best = name  # keep the LAST match (most recent mapping)
+        if best:
+            desc = _NVIDIA_BINDING_NAMES.get(best, best)
+            return f"{best} — \"{desc}\""
+        return None
+    except Exception as e:
+        log.debug("detect_nvidia_binding failed: %s", e)
+        return None
