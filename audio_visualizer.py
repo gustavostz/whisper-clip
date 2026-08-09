@@ -6,6 +6,7 @@ from PyQt5.QtGui import QPainter, QColor, QLinearGradient, QPen, QPainterPath, Q
 import collections
 import random
 import math
+import re
 
 
 class AudioVisualizer(QWidget):
@@ -40,6 +41,7 @@ class AudioVisualizer(QWidget):
         self.is_loading = False
         self.is_transcribing = False
         self.show_success = False
+        self.input_device_name = None  # Mic caption shown in the top-left corner
         self.opacity = 0.0
         self.target_opacity = 0.0
         self.loading_animation_value = 0.0  # For pulsing animation
@@ -95,6 +97,44 @@ class AudioVisualizer(QWidget):
         
         self.target_levels.append(normalized_level)
         
+    def set_input_device(self, name):
+        """Set the mic name captioned in the top-left corner (None hides it).
+
+        The Windows default input device changes behind our back (headset
+        connects, dock is plugged in), so the overlay names whichever mic the
+        audio actually came from.
+        """
+        self.input_device_name = self.pretty_device_name(name)
+        self.update()
+
+    @staticmethod
+    def pretty_device_name(name):
+        """Make a raw PortAudio device name fit for display.
+
+        Windows hands us names that are hostile to draw: Bluetooth headsets
+        arrive as driver resource strings with embedded CRLFs, e.g.
+        'Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0\\r\\n;(Buds2))'
+        — the friendly part is the last parenthesised group. MME also truncates
+        every name to 31 characters, usually leaving an unclosed '('.
+        """
+        if not name:
+            return None
+
+        name = " ".join(str(name).split())  # Collapse the CRLFs and tabs
+
+        if "@" in name:
+            groups = re.findall(r"\(([^()]+)\)", name)
+            friendly = groups[-1].strip() if groups else ""
+            if not friendly or friendly.startswith("@"):
+                # Truncated before the friendly part — keep the role only
+                friendly = name.split("(@", 1)[0].strip()
+            name = friendly or name
+
+        if name.count("(") > name.count(")"):
+            name += "…"  # Mark MME's mid-word cut
+
+        return name or None
+
     def start_loading(self):
         """Called when user initiates recording (shows loading state)"""
         self.is_loading = True
@@ -206,7 +246,10 @@ class AudioVisualizer(QWidget):
         
         # Draw background with gradient
         self.draw_background(painter)
-        
+
+        # Draw the mic caption above every state
+        self.draw_input_label(painter)
+
         # Draw content based on state
         if self.is_loading:
             self.draw_loading(painter)
@@ -237,6 +280,53 @@ class AudioVisualizer(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 15, 15)
         
+    def draw_input_label(self, painter):
+        """Draw a tiny mic glyph + device name in the top-left corner.
+
+        Deliberately dim and small so it reads as metadata: it clears the
+        tallest possible waveform bar (which tops out at y=24) and is elided
+        before the left edge of the centred status text.
+        """
+        if not self.input_device_name:
+            return
+
+        # Same purple as the waveform bars, dimmed so it never competes
+        color = QColor(147, 51, 234, 185)
+
+        x = 16
+        baseline = 19  # Text baseline / bottom of the mic glyph
+
+        # Mic glyph: capsule head, short stem, base bar (~8px tall)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawRoundedRect(QRect(x, baseline - 8, 4, 5), 2, 2)
+
+        painter.setPen(QPen(color, 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(x + 2, baseline - 3, x + 2, baseline - 1)
+        painter.drawLine(x, baseline - 1, x + 4, baseline - 1)
+
+        # Device name, elided so it stops short of the centred status text
+        font = QFont("Arial", 7)
+        font.setLetterSpacing(QFont.PercentageSpacing, 103)
+        painter.setFont(font)
+
+        text_x = x + 10
+        max_width = int(self.rect().width() * 0.31) - text_x
+        metrics = painter.fontMetrics()
+
+        label = self.input_device_name
+        if metrics.width(label) > max_width:
+            # Too wide for the corner: drop the Windows role prefix
+            # ("Microphone (HD Pro Webcam C920)" -> "HD Pro Webcam C920"),
+            # since the product name is what actually identifies the mic
+            inner = re.match(r"^[^()]+\((.+?)\)?$", label)
+            if inner:
+                label = re.sub(r"^\d+-\s*", "", inner.group(1).strip())
+
+        painter.drawText(text_x, baseline,
+                         metrics.elidedText(label, Qt.ElideRight, max_width))
+
     def draw_loading(self, painter):
         """Draw loading animation"""
         rect = self.rect()
@@ -339,7 +429,7 @@ class AudioVisualizer(QWidget):
         painter.setFont(font)
         text = "Transcription complete!" if self.show_success else "Transcribing audio..."
         text_rect = painter.fontMetrics().boundingRect(text)
-        painter.drawText(center.x() - text_rect.width() // 2, 
+        painter.drawText(center.x() - text_rect.width() // 2,
                         center.y() - 40, text)
         
         # Draw processing indicator (only when not showing success)
@@ -583,6 +673,7 @@ if __name__ == '__main__':
     visualizer = AudioVisualizer()
     
     # Test sequence: loading -> recording -> transcribing -> concurrent
+    visualizer.set_input_device("Microphone (2- HyperX QuadCast S)")
     visualizer.start_loading()
     
     def start_recording_test():

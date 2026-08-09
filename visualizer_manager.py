@@ -60,6 +60,10 @@ class VisualizerManager:
         """Update audio level in visualizer"""
         self.send_command('update_level', level)
 
+    def set_input_device(self, name):
+        """Set the mic name captioned in the visualizer (None hides it)"""
+        self.send_command('set_input_device', name)
+
     def start_loading(self):
         """Notify visualizer to show loading state"""
         if not self.enabled:
@@ -110,6 +114,8 @@ class VisualizerManager:
 
                     if command == 'update_level':
                         visualizer.update_audio_level(data)
+                    elif command == 'set_input_device':
+                        visualizer.set_input_device(data)
                     elif command == 'start_loading':
                         visualizer.start_loading()
                     elif command == 'start_recording':

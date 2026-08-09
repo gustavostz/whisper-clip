@@ -117,17 +117,18 @@ class AudioRecorder:
         self._save_to_clipboard_flag = True
         self._llm_prefix_flag = llm_context_prefix
 
-        self.save_to_clipboard = tk.BooleanVar(value=True)
-        self.clipboard_checkbox = tk.Checkbutton(bottom_frame, text="Save to Clipboard",
-                                                variable=self.save_to_clipboard, bg="white",
-                                                command=self._sync_checkbox_flags)
-        self.clipboard_checkbox.pack()
-
+        # Packed top-to-bottom: LLM Context Prefix sits above Save to Clipboard
         self.llm_context_prefix = tk.BooleanVar(value=llm_context_prefix)
         self.llm_prefix_checkbox = tk.Checkbutton(bottom_frame, text="LLM Context Prefix",
                                                   variable=self.llm_context_prefix, bg="white",
                                                   command=self._sync_checkbox_flags)
         self.llm_prefix_checkbox.pack()
+
+        self.save_to_clipboard = tk.BooleanVar(value=True)
+        self.clipboard_checkbox = tk.Checkbutton(bottom_frame, text="Save to Clipboard",
+                                                variable=self.save_to_clipboard, bg="white",
+                                                command=self._sync_checkbox_flags)
+        self.clipboard_checkbox.pack()
 
         # Daemon: exit_application joins with a timeout; a busy transcription
         # must not be able to keep a half-dead headless process alive forever.
@@ -209,6 +210,24 @@ class AudioRecorder:
         finally:
             self._toggle_lock.release()
 
+    def _input_device_name(self, device=None):
+        """Name of the mic PortAudio is (or would be) recording from.
+
+        With no argument this reports the current default input device; pass an
+        open stream's `device` for the one actually in use.
+        """
+        try:
+            if device is None:
+                info = sd.query_devices(kind='input')
+            else:
+                # InputStream.device is an int; a duplex Stream gives (in, out)
+                index = device[0] if isinstance(device, (list, tuple)) else device
+                info = sd.query_devices(index)
+            return str(info.get('name', '')).strip() or None
+        except Exception as e:
+            log.debug("Could not resolve input device name: %s", e)
+            return None
+
     def start_recording(self):
         log.info("Recording started")
         self.is_recording = True
@@ -216,6 +235,9 @@ class AudioRecorder:
 
         # Show visualizer in loading state immediately
         self.visualizer_manager.start_loading()
+        # Best-effort name up front; record_audio corrects it once the stream
+        # is open and the real device is known.
+        self.visualizer_manager.set_input_device(self._input_device_name())
 
         # Pre-load model in background to reduce latency when transcription starts.
         # The lock in WhisperClient prevents conflicts if model is already loaded
@@ -327,6 +349,12 @@ class AudioRecorder:
                 # hardcoding 44100 on a 48 kHz device pitch-shifts the audio
                 # and wrecks the transcription.
                 self._recorded_samplerate = int(stream.samplerate)
+
+                device_name = self._input_device_name(stream.device)
+                log.info("Recording from input device: %s (%d Hz)",
+                         device_name or "unknown", self._recorded_samplerate)
+                self.visualizer_manager.set_input_device(device_name)
+
                 while self.is_recording:
                     sd.sleep(100)
         except Exception as e:
@@ -503,7 +531,8 @@ class AudioRecorder:
                 # Pre-load model
                 threading.Thread(target=self._preload_model, daemon=True).start()
 
-                # Show visualizer in transcription state
+                # Show visualizer in transcription state (no mic involved)
+                self.visualizer_manager.set_input_device(None)
                 self.visualizer_manager.start_loading()
                 threading.Timer(1.0, self.visualizer_manager.start_transcription).start()
 
